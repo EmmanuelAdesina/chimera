@@ -1,61 +1,72 @@
-﻿# Causal Security Reasoning Engine
+﻿# Chimera Architecture
 
-## Architecture
+## The Reasoning Loop
 
-\\\
-                    Epistemic Plane
-                         |
-                         |
-    Crypto Plane <---- Causal Plane ----> Infra Plane
-    (Math proofs)       |              (IAM, K8s, Terraform)
-                        |
-                   Parser Cascades
-                   (Transport → App → DB → Defense)
-                        |
-                        |
-                   Execution Plane
-                   (Static analysis, Nuclei, Caido)
-\\\
+Chimera is not a scanner. It is a reasoning engine. Everything flows through this loop:
 
-## The Core Insight
+`\n1. OBSERVE\n      |\n      v\n2. MODEL (Build parser cascades, system models)\n      |\n      v\n3. HYPOTHESIZE (Generate falsifiable claims)\n      |\n      v\n4. INTERROGATE (Skeptic challenges each hypothesis)\n      |\n      v\n5. TEST (Gather evidence via execution adapters)\n      |\n      v\n6. UPDATE (Revise confidence based on observations)\n      |\n      v\n7. DECIDE (Confirm, reject, or iterate)\n      |\n      v\n8. REMEMBER (Store in structured memory)\n      |\n      +---> Back to 1 (with what we learned)\n`
 
-> The developer thinks there is one language. The machine is actually processing several languages in sequence.
+This separates Chimera from every scanner on the market. Scanners skip steps 2, 3, 4, and 6. They observe, then report. Chimera observes, models, claims, challenges, tests, revises, decides, and remembers.
 
-Chimera models each language boundary, computes grammar differentials, and proves where trust assumptions break.
+## The Central Object: Hypothesis
 
-## Grammar Differential
+Everything revolves around Hypothesis:
 
-A grammar differential exists when a character or token is **data** in layer *n* but **meta** in layer *n+1*, and no sanitizer translates between the grammars.
+| Field | Purpose |
+|-------|---------|
+| claim | The falsifiable statement |
+| equired_conditions | What must be true for the claim to hold |
+| evidence | Observations that support the claim |
+| missing_information | What we still need to know |
+| alsifiers | What would prove this claim false |
+| confidence | Current belief strength |
+| status | proposed → testing → confirmed / rejected |
 
-Example:
-- JSON: \"O'Brien\" → safe string
-- Python json.loads(): O'Brien → bare quote preserved
-- SQL f-string: 'O'Brien' → quote terminates literal, injection begins
+A finding is not a finding until it is a Hypothesis that has survived interrogation and testing.
 
-## Modules
+## The Four Planes
 
-| Module | Purpose |
-|--------|---------|
-| chimera/core/causal_engine.py | Grammar differential analyzer |
-| chimera/core/epistemic_engine.py | Confidence calibration, self-interrogation |
-| chimera/parsers/ | Parser cascade builders (JSON, SQL, Python AST, IAM) |
-| chimera/tools/nuclei_bridge.py | One-day baseline + template analysis |
-| chimera/tools/caido_bridge.py | Request execution + response observation |
-| chimera/analysis/intent_model.py | Developer Intent Model (DIM) extraction |
-| chimera/analysis/implementation.py | Actual Implementation Model (AIM) extraction |
+### Causal Plane
+- CausalEngine: Analyzes parser cascades for grammar differentials
+- ParserLayer: Represents one layer in the cascade
+- GrammarDifferential: Proof that a trust boundary is violated
+- **Output**: Hypothesis objects with required conditions and falsifiers
 
-## 30-Day Target
+### Epistemic Plane
+- EpistemicMonitor: Interrogates hypotheses before they become beliefs
+- Questions every hypothesis: \"What would prove you wrong?\"
+- Tracks known biases and calibration history
+- **Output**: Surviving hypotheses promoted to 	esting status
 
-Build the grammar differential analyzer for one cascade:
-- **Input**: Python web app using json.loads() + f-string SQL construction
-- **Output**: Proof that the JSON → Python → SQL boundary contains a grammar differential at the quote character
-- **Evidence**: Causal narrative + exact code location + exploit path
+### Memory Plane
+Two systems, distinct purposes:
 
-## Running
+**Structured Memory (SQLite) — Source of Truth**
+- hypotheses: All hypotheses with full provenance
+- indings: Confirmed hypotheses with proof
+- decisions: Why we took each action
+- ailures: What went wrong and why
 
-`ash
-# Install
-pip install -e .
+**Semantic Memory (Vector DB) — Retrieval Aid**
+- Similar code patterns
+- Similar vulnerability classes
+- Previous reasoning chains
+- **Never** the source of truth. Always derived from structured memory.
 
-# Run causal analysis on a target
-python -m chimera analyze --target ./tests/targets/vuln_app.py --cascade json-python-sql
+### Execution Plane
+Capabilities, not products:
+
+| Capability | Purpose | Current Adapters |
+|------------|---------|------------------|
+| **Observation** | Map target surface | Nuclei |
+| **Controlled Testing** | Send crafted inputs, observe responses | Caido |
+| **Environment Interaction** | Act like a user or system | Browser, Terminal |
+| **Runtime Verification** | Confirm exploitability without damage | Custom instrumentation |
+
+Adapters are replaceable. The capability is stable.
+
+## Solo Developer Rules
+- One make test runs everything in < 10 seconds
+- Pydantic models enforce contracts across modules
+- Every module has a Base* ABC for extension
+- Hypothesis is the center of gravity — everything produces, consumes, or validates it
