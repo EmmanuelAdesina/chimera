@@ -20,7 +20,7 @@ Everything revolves around Hypothesis:
 | missing_information | What we still need to know |
 | alsifiers | What would prove this claim false |
 | confidence | Current belief strength |
-| status | proposed → testing → confirmed / rejected |
+| status | proposed â†’ testing â†’ confirmed / rejected |
 
 A finding is not a finding until it is a Hypothesis that has survived interrogation and testing.
 
@@ -41,13 +41,13 @@ A finding is not a finding until it is a Hypothesis that has survived interrogat
 ### Memory Plane
 Two systems, distinct purposes:
 
-**Structured Memory (SQLite) — Source of Truth**
+**Structured Memory (SQLite) â€” Source of Truth**
 - hypotheses: All hypotheses with full provenance
 - indings: Confirmed hypotheses with proof
 - decisions: Why we took each action
 - ailures: What went wrong and why
 
-**Semantic Memory (Vector DB) — Retrieval Aid**
+**Semantic Memory (Vector DB) â€” Retrieval Aid**
 - Similar code patterns
 - Similar vulnerability classes
 - Previous reasoning chains
@@ -69,4 +69,4 @@ Adapters are replaceable. The capability is stable.
 - One make test runs everything in < 10 seconds
 - Pydantic models enforce contracts across modules
 - Every module has a Base* ABC for extension
-- Hypothesis is the center of gravity — everything produces, consumes, or validates it
+- Hypothesis is the center of gravity â€” everything produces, consumes, or validates it

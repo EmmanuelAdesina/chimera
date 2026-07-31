@@ -6,14 +6,14 @@ Finds violated security assumptions by modeling parser cascades, grammar differe
 
 ## The Reasoning Loop
 
-1. **Observe** — Gather raw target data
-2. **Model** — Build parser cascades and system models
-3. **Hypothesize** — Generate falsifiable claims
-4. **Interrogate** — Skeptic challenges each hypothesis
-5. **Test** — Gather evidence via execution adapters
-6. **Update** — Revise confidence based on observations
-7. **Decide** — Confirm, reject, or iterate
-8. **Remember** — Store everything in structured memory
+1. **Observe** â€” Gather raw target data
+2. **Model** â€” Build parser cascades and system models
+3. **Hypothesize** â€” Generate falsifiable claims
+4. **Interrogate** â€” Skeptic challenges each hypothesis
+5. **Test** â€” Gather evidence via execution adapters
+6. **Update** â€” Revise confidence based on observations
+7. **Decide** â€” Confirm, reject, or iterate
+8. **Remember** â€” Store everything in structured memory
 
 ## Quick Start
 
