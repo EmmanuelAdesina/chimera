@@ -1,5 +1,7 @@
 ﻿# Chimera
 
+CHIMERA is a scientific reasoning engine for offensive security. It constructs falsifiable hypotheses about software systems, actively gathers evidence through controlled execution, updates beliefs using structured reasoning, and produces defensible security findings.
+
 **Causal Security Reasoning Engine**
 
 Finds violated security assumptions by modeling parser cascades, grammar differentials, and intent-vs-implementation contradictions.
