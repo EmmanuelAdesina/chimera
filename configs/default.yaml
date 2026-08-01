@@ -1,0 +1,30 @@
+﻿chimera:
+  version: "0.1.0"
+
+  llm:
+    provider: "anthropic"
+    model: "claude-sonnet-4"
+    temperature: 0.1
+    max_tokens: 4096
+
+  limits:
+    max_hypotheses: 100
+    max_requests_per_second: 10
+    timeout_seconds: 300
+
+  epistemic:
+    confidence_threshold: 0.6
+    require_evidence: true
+    calibration_window: 100
+
+  memory:
+    backend: "sqlite"
+    path: "./data/memory.db"
+
+  tools:
+    nuclei:
+      binary: "nuclei"
+      rate_limit: 150
+    caido:
+      api_url: "http://localhost:8080"
+      api_token: ""

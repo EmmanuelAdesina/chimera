@@ -1,12 +1,32 @@
-﻿.venv/
-pycache/
-*.pyc
-.env
+﻿# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.venv/
+venv/
+ENV/
 *.egg-info/
 dist/
 build/
-.mypy_cache/
 .pytest_cache/
-.chimera/
-data/memory/
-data/findings/
+.mypy_cache/
+
+# Data / Secrets
+data/
+*.db
+*.sqlite
+.env
+.env.*
+*.pem
+*.key
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

@@ -6,4 +6,71 @@ from chimera.models.evidence import Evidence
 
 
 class EpistemicMonitor:
-n    '''\n    Interrogates Hypotheses before they become beliefs.\n    \n    Every hypothesis must survive:\n    - \"What evidence supports this?\"\n    - \"What would prove this false?\"\n    - \"What are we assuming that we haven't verified?\"\n    '''\n\n    def __init__(self, confidence_threshold: float = 0.6):\n        self.confidence_threshold = confidence_threshold\n        self.known_biases: Dict[str, float] = {}\n        self.interrogation_history: List[Dict] = []\n\n    def interrogate(self, hypothesis: Hypothesis) -> bool:\n        '''\n        The Skeptic interrogates a hypothesis.\n        Returns True if hypothesis survives, False if rejected.\n        '''\n        failures = []\n        \n        # Check 1: Confidence too low\n        if hypothesis.confidence < self.confidence_threshold:\n            failures.append(f'Confidence {hypothesis.confidence} below threshold {self.confidence_threshold}')\n        \n        # Check 2: No evidence\n        if not hypothesis.evidence:\n            failures.append('Zero evidence provided')\n        \n        # Check 3: All required conditions have evidence?\n        evidence_coverage = hypothesis.check_completeness()\n        if evidence_coverage < 0.5:\n            failures.append(f'Evidence coverage only {evidence_coverage:.2f}')\n        \n        # Check 4: Known biases\n        for bias, failure_rate in self.known_biases.items():\n            if bias.lower() in hypothesis.claim.lower():\n                adjusted = hypothesis.confidence * (1 - failure_rate)\n                if adjusted < self.confidence_threshold:\n                    failures.append(f'Known bias \"{bias}\" reduces effective confidence to {adjusted:.2f}')\n        \n        # Check 5: Missing critical information\n        critical_missing = [m for m in hypothesis.missing_information \n                           if 'runtime' in m.lower() or 'execution' in m.lower()]\n        if len(critical_missing) > 2:\n            failures.append(f'Too much missing runtime information: {len(critical_missing)} items')\n        \n        result = len(failures) == 0\n        \n        self.interrogation_history.append({\n            'hypothesis_id': hypothesis.id,\n            'timestamp': datetime.utcnow().isoformat(),\n            'survived': result,\n            'failures': failures,\n            'original_confidence': hypothesis.confidence\n        })\n        \n        return result\n\n    def calibrate(self, hypothesis: Hypothesis, actual_outcome: str):\n        '''\n        After testing, record whether the hypothesis was correct.\n        Used to update known biases.\n        '''\n        was_correct = actual_outcome == 'confirmed'\n        \n        # Find patterns in incorrect hypotheses\n        if not was_correct:\n            for condition in hypothesis.required_conditions:\n                # Track which conditions keep failing\n                pass  # TODO: implement bias learning\n\n    def register_bias(self, assumption_pattern: str, historical_failure_rate: float):\n        self.known_biases[assumption_pattern] = historical_failure_rate\n\n    def calibration_report(self) -> Dict:\n        if not self.interrogation_history:\n            return {'status': 'no_interrogations'}\n        \n        total = len(self.interrogation_history)\n        passed = sum(1 for h in self.interrogation_history if h['survived'])\n        \n        return {\n            'total_interrogated': total,\n            'survived': passed,\n            'rejected': total - passed,\n            'survival_rate': passed / total if total > 0 else 0,\n            'known_biases': len(self.known_biases)\n        }
+    """
+    Interrogates Hypotheses before they become beliefs.
+    """
+
+    def __init__(self, confidence_threshold: float = 0.6):
+        self.confidence_threshold = confidence_threshold
+        self.known_biases: Dict[str, float] = {}
+        self.interrogation_history: List[Dict] = []
+
+    def interrogate(self, hypothesis: Hypothesis) -> bool:
+        failures = []
+        
+        if hypothesis.confidence < self.confidence_threshold:
+            failures.append(f"Confidence {hypothesis.confidence} below threshold {self.confidence_threshold}")
+        
+        if not hypothesis.evidence:
+            failures.append("Zero evidence provided")
+        
+        evidence_coverage = hypothesis.check_completeness()
+        if evidence_coverage < 0.5:
+            failures.append(f"Evidence coverage only {evidence_coverage:.2f}")
+        
+        for bias, failure_rate in self.known_biases.items():
+            if bias.lower() in hypothesis.claim.lower():
+                adjusted = hypothesis.confidence * (1 - failure_rate)
+                if adjusted < self.confidence_threshold:
+                    failures.append(f"Known bias '{bias}' reduces effective confidence to {adjusted:.2f}")
+        
+        critical_missing = [m for m in hypothesis.missing_information 
+                           if "runtime" in m.lower() or "execution" in m.lower()]
+        if len(critical_missing) > 2:
+            failures.append(f"Too much missing runtime information: {len(critical_missing)} items")
+        
+        result = len(failures) == 0
+        
+        self.interrogation_history.append({
+            "hypothesis_id": hypothesis.id,
+            "timestamp": datetime.utcnow().isoformat(),
+            "survived": result,
+            "failures": failures,
+            "original_confidence": hypothesis.confidence
+        })
+        
+        return result
+
+    def calibrate(self, hypothesis: Hypothesis, actual_outcome: str):
+        was_correct = actual_outcome == "confirmed"
+        if not was_correct:
+            for condition in hypothesis.required_conditions:
+                pass
+
+    def register_bias(self, assumption_pattern: str, historical_failure_rate: float):
+        self.known_biases[assumption_pattern] = historical_failure_rate
+
+    def calibration_report(self) -> Dict:
+        if not self.interrogation_history:
+            return {"status": "no_interrogations"}
+        
+        total = len(self.interrogation_history)
+        passed = sum(1 for h in self.interrogation_history if h["survived"])
+        
+        return {
+            "total_interrogated": total,
+            "survived": passed,
+            "rejected": total - passed,
+            "survival_rate": passed / total if total > 0 else 0,
+            "known_biases": len(self.known_biases)
+        }

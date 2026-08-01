@@ -1,23 +1,59 @@
-﻿[metadata]
+﻿[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
 name = "chimera"
 version = "0.1.0"
 description = "Causal security reasoning engine"
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.11"
-dependencies = [
-"openai>=1.0",
-"anthropic>=0.30",
-"networkx>=3.0",
-"tree-sitter>=0.22",
-"tree-sitter-python>=0.21",
-"requests>=2.31",
-"pydantic>=2.0",
-"chromadb>=0.5",
-"pytest>=8.0",
+authors = [{name = "Chimera Author"}]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: Information Technology",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Security",
 ]
+dependencies = [
+    "pydantic>=2.0",
+    "networkx>=3.0",
+    "pyyaml>=6.0",
+    "openai>=1.0",
+    "anthropic>=0.30",
+    "requests>=2.31",
+    # "docker>=7.0",       # Uncomment after installing Docker Desktop
+    # "playwright>=1.40",  # Uncomment after manual install: playwright install chromium
+]
+
 [project.optional-dependencies]
-dev = ["black", "ruff", "mypy", "pytest-cov"]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=4.0",
+    "black>=24.0",
+    "ruff>=0.4",
+    "mypy>=1.0",
+]
+
+[project.scripts]
+chimera = "chimera.__main__:main"
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["chimera*"]
+
+[tool.black]
+line-length = 100
+target-version = ["py311"]
+
+[tool.ruff]
+line-length = 100
+select = ["E", "F", "I", "N", "W"]
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true

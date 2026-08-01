@@ -1,12 +1,188 @@
 ﻿from typing import List
-from pathlib import Path
-
 from chimera.core.causal_engine import CausalEngine, ParserLayer
 from chimera.core.epistemic_engine import EpistemicMonitor
 from chimera.core.memory import ChimeraMemory
 from chimera.models.hypothesis import Hypothesis
 from chimera.models.causal import GrammarModel
 
+from chimera.core.world_state import WorldState
+from chimera.core.counterfactual import CounterfactualEngine
+from chimera.core.adversarial_sim import AdversarialSimulation
+from chimera.core.knowledge_graph import KnowledgeGraph
+from chimera.knowledge.taxonomies.cwe import CWETaxonomy
+from chimera.knowledge.frameworks.django_security_model import DjangoSecurityModel
 
 class ChimeraOrchestrator:
-n    '''\n    The Reasoning Loop:\n    \n    1. OBSERVE        â€” Gather raw data about the target\n    2. MODEL          â€” Build parser cascades and system models\n    3. HYPOTHESIZE    â€” Generate falsifiable claims\n    4. INTERROGATE    â€” Skeptic challenges each hypothesis\n    5. TEST           â€” Gather evidence via execution adapters\n    6. UPDATE         â€” Revise confidence based on observations\n    7. DECIDE         â€” Confirm, reject, or iterate\n    8. REMEMBER       â€” Store everything in structured memory\n    '''\n\n    def __init__(self, config_path: str = 'configs/default.yaml'):\n        self.causal = CausalEngine()\n        self.epistemic = EpistemicMonitor(confidence_threshold=0.6)\n        self.memory = ChimeraMemory()\n        self.config_path = config_path\n        self.hypotheses: List[Hypothesis] = []\n    \n    def run(self, target: str):\n        print(f'[CHIMERA] Starting Reasoning Loop on: {target}')\n        print('=' * 60)\n        \n        # === 1. OBSERVE ===\n        print('[1] OBSERVE: Gathering target surface...')\n        observations = self._observe(target)\n        print(f'    â†’ {len(observations)} raw observations')\n        \n        # === 2. MODEL ===\n        print('[2] MODEL: Building parser cascades...')\n        cascades = self._build_cascades(target, observations)\n        print(f'    â†’ {len(cascades)} parser cascades modeled')\n        \n        # === 3. HYPOTHESIZE ===\n        print('[3] HYPOTHESIZE: Generating falsifiable claims...')\n        for cascade in cascades:\n            hyps = self.causal.analyze_cascade(cascade, target=target)\n            self.hypotheses.extend(hyps)\n        print(f'    â†’ {len(self.hypotheses)} hypotheses generated')\n        \n        # === 4. INTERROGATE ===\n        print('[4] INTERROGATE: Skeptic challenges hypotheses...')\n        survivors = []\n        for hyp in self.hypotheses:\n            if self.epistemic.interrogate(hyp):\n                hyp.status = 'testing'\n                survivors.append(hyp)\n                print(f'    âœ“ {hyp.id}: {hyp.claim[:60]}...')\n            else:\n                hyp.status = 'rejected'\n                print(f'    âœ— {hyp.id}: REJECTED')\n        print(f'    â†’ {len(survivors)} survived interrogation')\n        \n        # === 5. TEST ===\n        print('[5] TEST: Gathering runtime evidence...')\n        for hyp in survivors:\n            self._test_hypothesis(hyp, target)\n        \n        # === 6. UPDATE ===\n        print('[6] UPDATE: Revising confidence...')\n        for hyp in survivors:\n            self._update_confidence(hyp)\n        \n        # === 7. DECIDE ===\n        print('[7] DECIDE: Final classification...')\n        confirmed = []\n        for hyp in survivors:\n            if hyp.confidence > 0.85 and hyp.check_completeness() > 0.8:\n                hyp.status = 'confirmed'\n                confirmed.append(hyp)\n            elif hyp.confidence < 0.3:\n                hyp.status = 'rejected'\n        print(f'    â†’ {len(confirmed)} CONFIRMED')\n        \n        # === 8. REMEMBER ===\n        print('[8] REMEMBER: Storing in structured memory...')\n        for hyp in self.hypotheses:\n            self.memory.structured.store_hypothesis(hyp)\n        print('    â†’ All hypotheses stored')\n        \n        self._print_report(confirmed)\n    \n    def _observe(self, target: str) -> List[dict]:\n        '''Phase 1: Raw observation.'''\n        # TODO: integrate execution adapters\n        return [{'source': 'static', 'type': 'file', 'path': target}]\n    \n    def _build_cascades(self, target: str, observations: List[dict]) -> List[List[ParserLayer]]:\n        '''Phase 2: Build parser cascades from observations.'''\n        # For now, return the canonical JSON->Python->SQL cascade\n        return [[\n            ParserLayer(\n                name='JSON',\n                grammar=GrammarModel(\n                    safe_chars={'a','b',' ','\\'', '\\\\'},\n                    meta_chars={'\\\\', '\"'},\n                    escape_rules={'\\\\': '\\\\\\\\', '\"': '\\\\\"'}\n                ),\n                sanitizer='JSON RFC 8259 escape'\n            ),\n            ParserLayer(\n                name='Python_str',\n                grammar=GrammarModel(\n                    safe_chars={'a','b',' ','\\''},\n                    meta_chars=set()\n                ),\n                sanitizer=None\n            ),\n            ParserLayer(\n                name='SQL_literal',\n                grammar=GrammarModel(\n                    safe_chars={'a','b',' '},\n                    meta_chars={'\\''}\n                ),\n                sanitizer=None\n            ),\n        ]]\n    \n    def _test_hypothesis(self, hyp: Hypothesis, target: str):\n        '''Phase 5: Gather runtime evidence.'''\n        # TODO: use execution adapters to test\n        # For now, simulate evidence gathering\n        from chimera.models.evidence import Evidence\n        hyp.add_evidence(Evidence(\n            source='static_analysis',\n            data={'finding': 'f-string query construction detected'},\n            confidence=0.8,\n            metadata={'file': target}\n        ))\n    \n    def _update_confidence(self, hyp: Hypothesis):\n        '''Phase 6: Bayesian-ish confidence update.'''\n        if not hyp.evidence:\n            return\n        \n        # Simple model: average evidence confidence weighted by source reliability\n        total_conf = sum(e.confidence for e in hyp.evidence)\n        avg_conf = total_conf / len(hyp.evidence)\n        \n        # Penalize missing information\n        missing_penalty = 0.1 * len(hyp.missing_information)\n        \n        hyp.confidence = max(0.0, min(1.0, avg_conf - missing_penalty))\n    \n    def _print_report(self, confirmed: List[Hypothesis]):\n        print('\\n' + '=' * 60)\n        print('CHIMERA REASONING LOOP REPORT')\n        print('=' * 60)\n        print(f'Total hypotheses generated: {len(self.hypotheses)}')\n        print(f'Confirmed: {len(confirmed)}')\n        print(f'Rejected: {sum(1 for h in self.hypotheses if h.status == \"rejected\")}')\n        print(f'In testing: {sum(1 for h in self.hypotheses if h.status == \"testing\")}')\n        \n        if confirmed:\n            print('\\n--- CONFIRMED FINDINGS ---')\n            for hyp in confirmed:\n                print(f'\\n[{hyp.id}] {hyp.claim[:80]}')\n                print(f'    Confidence: {hyp.confidence:.2f}')\n                print(f'    Evidence: {len(hyp.evidence)} items')\n                print(f'    Missing: {len(hyp.missing_information)} items')\n        print('=' * 60)
+    """
+    The Reasoning Loop:
+    1. OBSERVE        -> Gather raw data
+    2. MODEL          -> Build parser cascades
+    3. HYPOTHESIZE    -> Generate falsifiable claims
+    4. INTERROGATE    -> Skeptic challenges
+    5. TEST           -> Gather evidence
+    6. UPDATE         -> Revise confidence
+    7. DECIDE         -> Confirm/reject/iterate
+    8. REMEMBER       -> Store in structured memory
+    """
+
+    def __init__(self, config_path: str = "configs/default.yaml"):
+        self.causal = CausalEngine()
+        self.epistemic = EpistemicMonitor(confidence_threshold=0.6)
+        self.memory = ChimeraMemory()
+        self.config_path = config_path
+        self.hypotheses: List[Hypothesis] = []
+
+        # NEW: Reasoning enhancements
+        self.world_state = WorldState()
+        self.counterfactual = CounterfactualEngine()
+        self.adversarial = AdversarialSimulation()
+        self.knowledge_graph = KnowledgeGraph()
+        
+        # NEW: Knowledge bases
+        self.cwe_taxonomy = CWETaxonomy()
+        self.framework_models = {
+            "django": DjangoSecurityModel()
+        }
+
+    def run(self, target: str):
+        print(f"[CHIMERA] Starting Reasoning Loop on: {target}")
+        print("=" * 60)
+        
+        print("[1] OBSERVE: Gathering target surface...")
+        observations = self._observe(target)
+        print(f"    -> {len(observations)} raw observations")
+        
+        print("[2] MODEL: Building parser cascades...")
+        cascades = self._build_cascades(target, observations)
+        print(f"    -> {len(cascades)} parser cascades modeled")
+        
+        print("[3] HYPOTHESIZE: Generating falsifiable claims...")
+        for cascade in cascades:
+            hyps = self.causal.analyze_cascade(cascade, target=target)
+            self.hypotheses.extend(hyps)
+        print(f"    -> {len(self.hypotheses)} hypotheses generated")
+        
+        print("[4] INTERROGATE: Skeptic challenges hypotheses...")
+        survivors = []
+        for hyp in self.hypotheses:
+            if self.epistemic.interrogate(hyp):
+                hyp.status = "testing"
+                survivors.append(hyp)
+                print(f"    [PASS] {hyp.id}: {hyp.claim[:60]}...")
+            else:
+                hyp.status = "rejected"
+                print(f"    [FAIL] {hyp.id}: REJECTED")
+        print(f"    -> {len(survivors)} survived interrogation")
+        
+        print("[5] TEST: Gathering runtime evidence...")
+        for hyp in survivors:
+            self._test_hypothesis(hyp, target)
+        
+        print("[6] UPDATE: Revising confidence...")
+        for hyp in survivors:
+            self._update_confidence(hyp)
+        
+        print("[7] DECIDE: Final classification...")
+        confirmed = []
+        for hyp in survivors:
+            if hyp.confidence > 0.85 and hyp.check_completeness() > 0.8:
+                hyp.status = "confirmed"
+                confirmed.append(hyp)
+            elif hyp.confidence < 0.3:
+                hyp.status = "rejected"
+        print(f"    -> {len(confirmed)} CONFIRMED")
+        
+        print("[8] REMEMBER: Storing in structured memory...")
+        for hyp in self.hypotheses:
+            self.memory.structured.store_hypothesis(hyp)
+        print("    -> All hypotheses stored")
+        
+        self._print_report(confirmed)
+
+         # NEW: Phase 9 - Counterfactual exploration
+        print("[9] COUNTERFACTUAL: Exploring what-ifs...")
+        for hyp in confirmed:
+            variants = self.counterfactual.generate_counterfactuals(hyp)
+            print(f"    -> {len(variants)} counterfactual variants generated")
+        
+        # NEW: Phase 10 - Adversarial hardening
+        print("[10] ADVERSARIAL: Red/blue team debate...")
+        for hyp in confirmed:
+            debate_result = self.adversarial.debate(hyp)
+            if debate_result["recommendation"] == "gather_more_evidence":
+                hyp.status = "testing"  # Send back for more work
+        
+        # NEW: Phase 11 - Knowledge graph update
+        print("[11] KNOWLEDGE GRAPH: Updating entity model...")
+        self.knowledge_graph.add_entity(target, "target", {"type": "web_app"})
+        for hyp in confirmed:
+            self.knowledge_graph.add_entity(hyp.id, "vulnerability", 
+                                            {"claim": hyp.claim, "confidence": hyp.confidence})
+            self.knowledge_graph.add_relationship(target, hyp.id, "contains")
+
+    def _observe(self, target: str) -> List[dict]:
+        return [{"source": "static", "type": "file", "path": target}]
+
+    def _build_cascades(self, target: str, observations: List[dict]) -> List[List[ParserLayer]]:
+        return [[
+            ParserLayer(
+                name="JSON",
+                grammar=GrammarModel(
+                    safe_chars={"a","b"," ","'", "\\"},
+                    meta_chars={"\\", '"'},
+                    escape_rules={"\\": "\\\\", '"': '\\"'}
+                ),
+                sanitizer="JSON RFC 8259 escape"
+            ),
+            ParserLayer(
+                name="Python_str",
+                grammar=GrammarModel(
+                    safe_chars={"a","b"," ","'"},
+                    meta_chars=set()
+                ),
+                sanitizer=None
+            ),
+            ParserLayer(
+                name="SQL_literal",
+                grammar=GrammarModel(
+                    safe_chars={"a","b"," "},
+                    meta_chars={"'"}
+                ),
+                sanitizer=None
+            ),
+        ]]
+
+    def _test_hypothesis(self, hyp: Hypothesis, target: str):
+        from chimera.models.evidence import Evidence
+        hyp.add_evidence(Evidence(
+            source="static_analysis",
+            data={"finding": "f-string query construction detected"},
+            confidence=0.8,
+            metadata={"file": target}
+        ))
+
+    def _update_confidence(self, hyp: Hypothesis):
+        if not hyp.evidence:
+            return
+        total_conf = sum(e.confidence for e in hyp.evidence)
+        avg_conf = total_conf / len(hyp.evidence)
+        missing_penalty = 0.1 * len(hyp.missing_information)
+        hyp.confidence = max(0.0, min(1.0, avg_conf - missing_penalty))
+
+    def _print_report(self, confirmed: List[Hypothesis]):
+        print("\n" + "=" * 60)
+        print("CHIMERA REASONING LOOP REPORT")
+        print("=" * 60)
+        print(f"Total hypotheses generated: {len(self.hypotheses)}")
+        print(f"Confirmed: {len(confirmed)}")
+        print(f"Rejected: {sum(1 for h in self.hypotheses if h.status == 'rejected')}")
+        print(f"In testing: {sum(1 for h in self.hypotheses if h.status == 'testing')}")
+        
+        if confirmed:
+            print("\n--- CONFIRMED FINDINGS ---")
+            for hyp in confirmed:
+                print(f"\n[{hyp.id}] {hyp.claim[:80]}")
+                print(f"    Confidence: {hyp.confidence:.2f}")
+                print(f"    Evidence: {len(hyp.evidence)} items")
+                print(f"    Missing: {len(hyp.missing_information)} items")
+        print("=" * 60)

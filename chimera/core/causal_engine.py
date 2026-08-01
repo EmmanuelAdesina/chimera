@@ -14,4 +14,94 @@ class ParserLayer:
 
 
 class CausalEngine:
-n    '''\n    Analyzes parser cascades for grammar differentials.\n    Produces Hypothesis objects, not just reports.\n    '''\n\n    def __init__(self):\n        self.differentials: List[DifferentialReport] = []\n\n    def analyze_cascade(self, layers: List[ParserLayer], target: str = '') -> List[Hypothesis]:\n        '''\n        Analyze parser cascade and return Hypothesis objects for each differential.\n        '''\n        hypotheses = []\n        \n        for i in range(len(layers) - 1):\n            current = layers[i]\n            next_layer = layers[i + 1]\n            \n            unescaped_meta = current.grammar.safe_chars & next_layer.grammar.meta_chars\n            \n            if unescaped_meta and not current.sanitizer:\n                diff = DifferentialReport(\n                    boundary=f'{current.name} â†’ {next_layer.name}',\n                    dangerous_chars=unescaped_meta,\n                    developer_assumption=f'{current.name} output is safe for {next_layer.name}',\n                    actual_risk=f'Characters {unescaped_meta} are meta in {next_layer.name}',\n                    fix_recommendation=f'Insert sanitizer at boundary: escape {unescaped_meta} for {next_layer.name} grammar',\n                    confidence=0.95,\n                    evidence=[f'No sanitizer between {current.name} and {next_layer.name}']\n                )\n                \n                # Convert differential to hypothesis\n                hypothesis = self._differential_to_hypothesis(diff, target, layers)\n                hypotheses.append(hypothesis)\n        \n        return hypotheses\n\n    def _differential_to_hypothesis(self, diff: DifferentialReport, target: str, \n                                      layers: List[ParserLayer]) -> Hypothesis:\n        '''Transform a grammar differential into a falsifiable hypothesis.'''\n        \n        # Extract the dangerous character(s)\n        chars = ', '.join(diff.dangerous_chars)\n        \n        claim = (\n            f'Grammar differential at {diff.boundary}: '\n            f'character(s) [{chars}] are data in the upstream layer '\n            f'but meta-characters in the downstream layer, '\n            f'and no sanitizer translates between grammars.'\n        )\n        \n        return Hypothesis(\n            id=f'HYP-{hash(diff.boundary) % 10000:04d}',\n            claim=claim,\n            required_conditions=[\n                f'Data flows from {diff.boundary.split(\" â†’ \")[0]} to {diff.boundary.split(\" â†’ \")[1]}',\n                f'Character(s) {diff.dangerous_chars} appear in attacker-controlled input',\n                f'No sanitizer exists at the boundary',\n                f'Downstream layer interprets {diff.dangerous_chars} as control characters'\n            ],\n            evidence=[\n                Evidence(\n                    source='causal_engine',\n                    data=diff.model_dump(),\n                    confidence=diff.confidence,\n                    metadata={'boundary': diff.boundary, 'target': target}\n                )\n            ],\n            missing_information=[\n                'Attacker-controlled input path to the boundary',\n                'Runtime execution confirmation',\n                'WAF or defense layer interference'\n            ],\n            falsifiers=[\n                f'Input never contains {diff.dangerous_chars}',\n                'A sanitizer exists but was not detected',\n                'Downstream layer is not actually reached by user input',\n                'The application uses parameterized queries at a higher layer'\n            ],\n            confidence=diff.confidence * 0.7,  # Penalty for missing runtime evidence\n            status='proposed'\n        )
+    """
+    Analyzes parser cascades for grammar differentials.
+    Produces Hypothesis objects, not just reports.
+    """
+
+    def __init__(self):
+        self.differentials: List[DifferentialReport] = []
+
+    def analyze_cascade(self, layers: List[ParserLayer], target: str = "") -> List[Hypothesis]:
+        hypotheses = []
+        
+        for i in range(len(layers) - 1):
+            current = layers[i]
+            next_layer = layers[i + 1]
+            
+            unescaped_meta = current.grammar.safe_chars & next_layer.grammar.meta_chars
+            
+            if unescaped_meta and not current.sanitizer:
+                diff = DifferentialReport(
+                    boundary=f"{current.name} -> {next_layer.name}",
+                    dangerous_chars=unescaped_meta,
+                    developer_assumption=f"{current.name} output is safe for {next_layer.name}",
+                    actual_risk=f"Characters {unescaped_meta} are meta in {next_layer.name}",
+                    fix_recommendation=f"Insert sanitizer at boundary: escape {unescaped_meta} for {next_layer.name} grammar",
+                    confidence=0.95,
+                    evidence=[f"No sanitizer between {current.name} and {next_layer.name}"]
+                )
+                
+                hypothesis = self._differential_to_hypothesis(diff, target, layers)
+                hypotheses.append(hypothesis)
+        
+        return hypotheses
+
+    def _differential_to_hypothesis(self, diff: DifferentialReport, target: str, 
+                                      layers: List[ParserLayer]) -> Hypothesis:
+        chars = ", ".join(diff.dangerous_chars)
+        
+        claim = (
+            f"Grammar differential at {diff.boundary}: "
+            f"character(s) [{chars}] are data in the upstream layer "
+            f"but meta-characters in the downstream layer, "
+            f"and no sanitizer translates between grammars."
+        )
+        
+        return Hypothesis(
+            id=f"HYP-{hash(diff.boundary) % 10000:04d}",
+            claim=claim,
+            required_conditions=[
+                f"Data flows from {diff.boundary.split(' -> ')[0]} to {diff.boundary.split(' -> ')[1]}",
+                f"Character(s) {diff.dangerous_chars} appear in attacker-controlled input",
+                f"No sanitizer exists at the boundary",
+                f"Downstream layer interprets {diff.dangerous_chars} as control characters"
+            ],
+            evidence=[
+                Evidence(
+                    source="causal_engine",
+                    data=diff.model_dump(),
+                    confidence=diff.confidence,
+                    metadata={"boundary": diff.boundary, "target": target}
+                )
+            ],
+            missing_information=[
+                "Attacker-controlled input path to the boundary",
+                "Runtime execution confirmation",
+                "WAF or defense layer interference"
+            ],
+            falsifiers=[
+                f"Input never contains {diff.dangerous_chars}",
+                "A sanitizer exists but was not detected",
+                "Downstream layer is not actually reached by user input",
+                "The application uses parameterized queries at a higher layer"
+            ],
+            confidence=diff.confidence * 0.7,
+            status="proposed"
+        )
+
+    def full_analysis(self, target: str, layers: List[ParserLayer]) -> CascadeAnalysis:
+        diffs = self.analyze_cascade(layers, target)
+        
+        layer_models = [
+            ParserLayerModel(name=l.name, grammar=l.grammar, sanitizer=l.sanitizer)
+            for l in layers
+        ]
+        
+        return CascadeAnalysis(
+            target=target,
+            layers=layer_models,
+            differentials=diffs,
+            epistemic_confidence=0.95 if diffs else 0.1,
+            causal_narrative=""
+        )

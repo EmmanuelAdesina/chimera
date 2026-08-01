@@ -2,4 +2,4 @@
 
 def test_reasoning_loop_runs():
     orch = ChimeraOrchestrator()
-    orch.run('tests/targets/vuln_app.py')
+    orch.run("tests/targets/vuln_app.py")
