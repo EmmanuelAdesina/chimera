@@ -1,5 +1,5 @@
 ﻿import sys
-from chimera.core.orchestrator import ChimeraOrchestrator
+from .orchestrator import ChimeraOrchestrator
 
 def main():
     if len(sys.argv) < 2:
