@@ -1,300 +1,819 @@
-# chimera/core/debunker.py - COMPLETE VERSION
+"""Chimera Debunker — The Gatekeeper. Hostile adversarial review with 9 attack vectors.
 
-from typing import Dict, List, Optional
+The Debunker is the adversarial gatekeeper of Chimera. Every hypothesis MUST
+survive all 9 attack vectors to proceed to experimentation. Target: 90% false-
+positive kill rate.
+
+The 9 Attack Vectors:
+    1. Tautology Check — Is the claim trivially true/unfalsifiable?
+    2. Assumption Audit — Does it rely on unstated assumptions?
+    3. Counter-Example Search — Can we find a falsifying case?
+    4. Causal Chain Break — Does the causal chain hold logically?
+    5. Scope Creep — Is the claim broader than evidence supports?
+    6. Confirmation Bias — Was evidence selectively gathered?
+    7. Temporal Validity — Is this still valid given the code?
+    8. Semantic Drift — Have terms shifted meaning?
+    9. Attack Surface Mismatch — Does this actually affect security?
+"""
+
+from __future__ import annotations
 from dataclasses import dataclass, field
-from enum import Enum
-import re
-import requests
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
-from chimera.models.hypothesis import Hypothesis
-from chimera.models.evidence import Evidence
-
-
-class DebunkSeverity(Enum):
-    FATAL = "fatal"           # Hypothesis is definitely wrong
-    CRITICAL = "critical"     # Major flaw, probably wrong
-    WARNING = "warning"       # Weakness, needs more evidence
-    COSMETIC = "cosmetic"     # Minor issue with claim wording
+if TYPE_CHECKING:
+    from chimera.models.hypothesis import Hypothesis, HypothesisStatus, VulnerabilityClass
+    from chimera.core.semantic_graph import SemanticGraph
 
 
 @dataclass
-class DebunkFinding:
-    attack_vector: str
-    severity: DebunkSeverity
+class DebunkResult:
+    """Result of a single attack vector on a hypothesis."""
+    attack_name: str
+    survived: bool
+    score: float
     reasoning: str
-    evidence_required: List[str]
-    confidence_impact: float
+    kill_reason: str = ""
+    suggested_refinement: str = ""
+
+
+@dataclass
+class DebunkReport:
+    """Complete debunking report for a hypothesis."""
+    hypothesis_id: str
+    survived_all: bool
+    attack_results: List[DebunkResult]
+    overall_score: float
+    recommendation: str
 
 
 class Debunker:
     """
-    The adversarial agent that tries to destroy hypotheses before they waste human time.
-    
-    Design principle: Be maximally hostile. Assume every hypothesis is garbage.
-    Only let through the ones that survive cross-examination.
-    
-    Target: 90% false positive filtration rate.
+    Hostile adversarial reviewer. Attacks every hypothesis with 9 vectors.
+
+    The Debunker does not care about being fair. It actively tries to
+    destroy hypotheses. Only the strongest survive.
     """
 
-    def __init__(self):
-        self.attacks: List[callable] = [
-            self._attack_correlation_vs_causation,
-            self._attack_confounding_variable,
-            self._attack_reachability,
-            self._attack_defense_layer,
-            self._attack_semantic_misdirection,
-            self._attack_version_mismatch,      # IMPLEMENTED
-            self._attack_context_irrelevance,
-            self._attack_duplicate_or_known,    # IMPLEMENTED
-            self._attack_exploitability_doubt,  # IMPLEMENTED
+    # Patterns that indicate tautological claims
+    _TAUTOLOGY_PATTERNS = [
+        "does not check", "lacks a check", "is missing",
+        "no check found", "without checking", "fails to check",
+    ]
+
+    # Common unstated assumptions to audit
+    _COMMON_ASSUMPTIONS = [
+        "no middleware enforces authorization",
+        "no framework-level protection exists",
+        "no database-level row security",
+        "no WAF rules block the attack",
+        "no API gateway enforces policies",
+        "no rate limiting prevents brute force",
+        "the application is the only access point",
+        "error messages do not leak information",
+        "logs are not monitored for anomalies",
+    ]
+
+    # Confirmation bias indicators
+    _BIAS_INDICATORS = [
+        "only", "all", "every", "always", "never", "definitely",
+        "clearly", "obviously", "certainly",
+    ]
+
+    def __init__(self) -> None:
+        self.total_debunked = 0
+        self.total_survived = 0
+        self.attack_stats: Dict[str, Dict[str, int]] = {}
+
+    def debunk(
+        self,
+        hypothesis: Hypothesis,
+        graph: Optional[SemanticGraph] = None,
+        memory: Optional[object] = None,
+    ) -> DebunkReport:
+        """Run all 9 attack vectors. Return a complete report."""
+        attacks = [
+            ("tautology_check", self.tautology_check),
+            ("assumption_audit", self.assumption_audit),
+            ("counter_example_search", self.counter_example_search),
+            ("causal_chain_break", self.causal_chain_break),
+            ("scope_creep", self.scope_creep),
+            ("confirmation_bias", self.confirmation_bias),
+            ("temporal_validity", self.temporal_validity),
+            ("semantic_drift", self.semantic_drift),
+            ("attack_surface_mismatch", self.attack_surface_mismatch),
         ]
-        self.kill_threshold = 0.3
-        self.memory = None  # Will be injected for duplicate checking
 
-    def debunk(self, hypothesis: Hypothesis) -> Dict:
-        findings: List[DebunkFinding] = []
-        original_confidence = hypothesis.confidence
+        results: List[DebunkResult] = []
+        for name, method in attacks:
+            result = method(hypothesis, graph, memory)
+            results.append(result)
+            self._record_attack(name, result)
+            if not result.survived:
+                # Hypothesis killed — stop immediately
+                hypothesis.debunker_notes[name] = result.to_dict() if hasattr(result, 'to_dict') else {"survived": False, "kill_reason": result.kill_reason}
+                hypothesis.transition_to(HypothesisStatus.DEBUNKED) if hasattr(hypothesis, 'transition_to') else None
+                self.total_debunked += 1
+                return DebunkReport(
+                    hypothesis_id=hypothesis.id,
+                    survived_all=False,
+                    attack_results=results,
+                    overall_score=0.0,
+                    recommendation="kill",
+                )
 
-        for attack in self.attacks:
-            finding = attack(hypothesis)
-            if finding:
-                findings.append(finding)
-                hypothesis.confidence -= finding.confidence_impact
+        # All attacks survived
+        scores = [r.score for r in results]
+        overall = min(scores)
+        if overall >= 0.6:
+            rec = "proceed"
+        elif overall >= 0.3:
+            rec = "refine"
+        else:
+            rec = "kill"
 
-        hypothesis.confidence = max(0.0, min(1.0, hypothesis.confidence))
-
-        survived = hypothesis.confidence >= self.kill_threshold
-
-        if not survived:
-            hypothesis.status = "rejected"
-
-        return {
-            "hypothesis_id": hypothesis.id,
-            "original_confidence": original_confidence,
-            "final_confidence": hypothesis.confidence,
-            "survived": survived,
-            "findings": findings,
-            "verdict": "PASS_TO_TRIAGE" if survived else "DEBUNKED",
-            "kill_reason": self._summarize_kill(findings) if not survived else None
+        hypothesis.debunker_notes = {
+            r.attack_name: {"score": r.score, "reasoning": r.reasoning}
+            for r in results
         }
+        self.total_survived += 1
 
-    # ───────────────────────────────────────────
-    # ATTACK 1: Correlation vs. Causation
-    # ───────────────────────────────────────────
-    def _attack_correlation_vs_causation(self, hyp: Hypothesis) -> Optional[DebunkFinding]:
-        observational_only = all(
-            e.source in ["static_analysis", "pattern_match", "regex"]
-            for e in hyp.evidence
+        return DebunkReport(
+            hypothesis_id=hypothesis.id,
+            survived_all=True,
+            attack_results=results,
+            overall_score=overall,
+            recommendation=rec,
         )
-        if observational_only and len(hyp.evidence) < 2:
-            return DebunkFinding(
-                attack_vector="correlation_vs_causation",
-                severity=DebunkSeverity.CRITICAL,
-                reasoning="Evidence is purely observational. No data-flow proof.",
-                evidence_required=["Taint analysis", "Dynamic trace"],
-                confidence_impact=0.4
-            )
-        return None
 
-    # ───────────────────────────────────────────
-    # ATTACK 2: Confounding Variable
-    # ───────────────────────────────────────────
-    def _attack_confounding_variable(self, hyp: Hypothesis) -> Optional[DebunkFinding]:
-        if "framework" in hyp.claim.lower() or "library" in hyp.claim.lower():
-            return DebunkFinding(
-                attack_vector="confounding_variable",
-                severity=DebunkSeverity.WARNING,
-                reasoning="May be a documented framework behavior.",
-                evidence_required=["Framework docs", "Security advisory"],
-                confidence_impact=0.2
-            )
-        return None
+    # ==================================================================
+    # ATTACK 1: Tautology Check
+    # ==================================================================
 
-    # ───────────────────────────────────────────
-    # ATTACK 3: Reachability
-    # ───────────────────────────────────────────
-    def _attack_reachability(self, hyp: Hypothesis) -> Optional[DebunkFinding]:
-        unreachable_keywords = ["admin_only", "internal_api", "test_", "localhost", "debug_mode", "requires_auth"]
-        for kw in unreachable_keywords:
-            if kw in str(hyp.metadata if hasattr(hyp, 'metadata') else {}):
-                return DebunkFinding(
-                    attack_vector="reachability",
-                    severity=DebunkSeverity.CRITICAL,
-                    reasoning=f"Code path contains '{kw}', unlikely attacker-accessible.",
-                    evidence_required=["Public endpoint mapping", "Auth bypass proof"],
-                    confidence_impact=0.5
+    def tautology_check(
+        self, h: Hypothesis, graph: Optional[SemanticGraph] = None, memory: Optional[object] = None
+    ) -> DebunkResult:
+        """
+        Attack 1: Is the claim trivially true or unfalsifiable?
+
+        A tautology restates the observation as the claim without adding
+        inferential value. E.g., "code that doesn't check auth doesn't check auth"
+        is technically true but useless as a vulnerability hypothesis.
+        """
+        claim_lower = h.claim.lower()
+
+        # Check for tautological patterns
+        tautology_score = 1.0
+        tautology_issues = []
+
+        for pattern in self._TAUTOLOGY_PATTERNS:
+            if pattern in claim_lower:
+                # The claim might be tautological — check if it adds inferential value
+                if claim_lower.count(pattern) > 1 or                    self._is_near_tautology(claim_lower, pattern):
+                    tautology_score -= 0.3
+                    tautology_issues.append(
+                        f"Claim contains tautological pattern: '{pattern}'. "
+                        f"The assertion restates the observation without adding causal insight."
+                    )
+
+        # Check if the claim is unfalsifiable (no concrete conditions)
+        if not h.falsifiers:
+            tautology_score -= 0.4
+            tautology_issues.append(
+                "Hypothesis has no falsifiers. An unfalsifiable claim cannot be "
+                "scientifically tested and is therefore useless."
+            )
+
+        # Check if claim and observation are too similar
+        if h.implementation_model_ref and h.claim:
+            obs_words = set(h.implementation_model_ref.lower().split())
+            claim_words = set(h.claim.lower().split())
+            if obs_words and claim_words:
+                overlap = len(obs_words & claim_words) / len(claim_words)
+                if overlap > 0.8:
+                    tautology_score -= 0.2
+                    tautology_issues.append(
+                        f"Claim overlaps {overlap:.0%} with the observation. "
+                        f"The claim adds minimal inferential value beyond restating what was observed."
+                    )
+
+        survived = tautology_score > 0.0
+        kill_reason = " ; ".join(tautology_issues) if not survived else ""
+        return DebunkResult(
+            attack_name="tautology_check",
+            survived=survived,
+            score=max(0.0, tautology_score),
+            reasoning=" ; ".join(tautology_issues) if tautology_issues else "Claim is specific and falsifiable with clear causal reasoning.",
+            kill_reason=kill_reason,
+            suggested_refinement="Add causal chain from root cause to impact, and include specific falsifiers." if not survived else "",
+        )
+
+    def _is_near_tautology(self, claim: str, pattern: str) -> bool:
+        """Check if a claim is near-tautological."""
+        # If the claim is essentially "X doesn't do Y" and the observation is also about X not doing Y
+        impl = ""
+        # We can't access h here, so this is a heuristic on the claim text alone
+        if "however" in claim or "but" in claim:
+            return False  # Has a contrast, not pure tautology
+        if "because" in claim or "leads to" in claim or "allows" in claim:
+            return False  # Has causal reasoning
+        return True
+
+    # ==================================================================
+    # ATTACK 2: Assumption Audit
+    # ==================================================================
+
+    def assumption_audit(
+        self, h: Hypothesis, graph: Optional[SemanticGraph] = None, memory: Optional[object] = None
+    ) -> DebunkResult:
+        """
+        Attack 2: Does the hypothesis rely on unstated assumptions?
+
+        Many vulnerability hypotheses assume the analyzed code is the ONLY
+        defense layer. In reality, middleware, WAFs, API gateways, database
+        policies, or framework-level protections may provide defense in depth.
+        """
+        score = 1.0
+        issues = []
+
+        # Check against common unstated assumptions
+        claim_lower = h.claim.lower()
+
+        for assumption in self._COMMON_ASSUMPTIONS:
+            assumption_lower = assumption.lower()
+            # Check if this assumption is implicitly relied upon
+            negated = assumption_lower.replace("no ", "")
+            if negated in claim_lower or assumption_lower in claim_lower:
+                # The hypothesis seems to assume this — check if it's stated as a prerequisite
+                is_prerequisite = any(
+                    assumption_lower in prereq.lower() or negated in prereq.lower()
+                    for prereq in h.prerequisite_conditions
                 )
-        return None
+                if not is_prerequisite:
+                    score -= 0.15
+                    issues.append(
+                        f"Hypothesis implicitly assumes '{assumption}' but does not "
+                        f"state it as a prerequisite condition."
+                    )
 
-    # ───────────────────────────────────────────
-    # ATTACK 4: Defense Layer
-    # ───────────────────────────────────────────
-    def _attack_defense_layer(self, hyp: Hypothesis) -> Optional[DebunkFinding]:
-        defense_indicators = ["waf", "cloudflare", "mod_security", "rasp", "input_validation", "csp", "csrf_token"]
-        addresses_defense = any(d in str(hyp.claim).lower() or d in str(hyp.missing_information).lower() for d in defense_indicators)
-        if not addresses_defense and "injection" in hyp.claim.lower():
-            return DebunkFinding(
-                attack_vector="defense_layer",
-                severity=DebunkSeverity.WARNING,
-                reasoning="Injection claim made without evaluating WAF/RASP interference.",
-                evidence_required=["WAF rule analysis", "RASP bypass confirmation"],
-                confidence_impact=0.25
+        # Check if graph shows middleware protections that the hypothesis ignores
+        if graph:
+            for entity_id in h.attack_surface:
+                node = graph.get_node(entity_id)
+                if node:
+                    # Check for middleware edges
+                    for edge in graph.get_incoming_edges(entity_id):
+                        if hasattr(edge, 'edge_type') and edge.edge_type.value == "middleware":
+                            score -= 0.25
+                            issues.append(
+                                f"Entity '{node.name}' has middleware protection via graph edge, "
+                                f"but hypothesis does not account for it."
+                            )
+
+        # Check if falsifiers cover the assumption space
+        if len(h.falsifiers) < 2:
+            score -= 0.15
+            issues.append(
+                f"Only {len(h.falsifiers)} falsifier(s). At least 2-3 needed to cover "
+                f"common defense-in-depth scenarios (middleware, framework, DB-level)."
             )
-        return None
 
-    # ───────────────────────────────────────────
-    # ATTACK 5: Semantic Misdirection
-    # ───────────────────────────────────────────
-    def _attack_semantic_misdirection(self, hyp: Hypothesis) -> Optional[DebunkFinding]:
-        if "sql" in hyp.claim.lower():
-            # Check if evidence actually proves SQL, not just the word 'query'
-            if "query" in str(hyp.evidence).lower() and "sql" not in str(hyp.evidence).lower():
-                return DebunkFinding(
-                    attack_vector="semantic_misdirection",
-                    severity=DebunkSeverity.WARNING,
-                    reasoning="'Query' in evidence may refer to GraphQL, not SQL.",
-                    evidence_required=["Database driver identification", "Actual SQL injection proof"],
-                    confidence_impact=0.3
+        survived = score > 0.0
+        return DebunkResult(
+            attack_name="assumption_audit",
+            survived=survived,
+            score=max(0.0, score),
+            reasoning=" ; ".join(issues) if issues else "Key assumptions are explicitly stated as prerequisites.",
+            kill_reason=" ; ".join(issues) if not survived else "",
+            suggested_refinement=(
+                "Add missing assumptions as prerequisite_conditions. "
+                "Investigate middleware and framework-level protections."
+            ) if score < 0.6 else "",
+        )
+
+    # ==================================================================
+    # ATTACK 3: Counter-Example Search
+    # ==================================================================
+
+    def counter_example_search(
+        self, h: Hypothesis, graph: Optional[SemanticGraph] = None, memory: Optional[object] = None
+    ) -> DebunkResult:
+        """
+        Attack 3: Can we find a case where the claim would be false?
+
+        This attack tries to construct counter-examples — specific scenarios
+        where the vulnerability would NOT be exploitable despite the claim.
+        """
+        score = 0.8  # Start with benefit of the doubt
+        counter_examples = []
+
+        # Counter-example 1: Framework-level protection
+        if h.vulnerability_class and h.vulnerability_class.value in {"idor", "privilege_escalation_horizontal"}:
+            counter_examples.append(
+                "Framework (Django/Flask) may enforce object-level permissions at the queryset level, "
+                "making the endpoint-level check unnecessary."
+            )
+            score -= 0.2
+
+        # Counter-example 2: Decorator not visible in AST but applied at runtime
+        if "decorator" in h.claim.lower() or "no auth" in h.claim.lower():
+            counter_examples.append(
+                "Authorization may be applied via a base class decorator, mixin, "
+                "or metaclass that is not visible in the function-level AST analysis."
+            )
+            score -= 0.15
+
+        # Counter-example 3: The function may be internal-only
+        if h.attack_surface:
+            for eid in h.attack_surface:
+                if graph:
+                    node = graph.get_node(eid)
+                    if node:
+                        # Check if function is not exposed as an endpoint
+                        has_route = node.properties.get("route", "")
+                        is_endpoint = node.properties.get("is_endpoint", False)
+                        if not has_route and not is_endpoint:
+                            counter_examples.append(
+                                f"Function '{node.name}' is not directly exposed as an HTTP endpoint. "
+                                f"It may only be called internally with pre-validated inputs."
+                            )
+                            score -= 0.25
+                            break
+
+        # Counter-example 4: Overgeneralization from one code pattern
+        if h.evidence and len(h.evidence) == 1:
+            counter_examples.append(
+                "Hypothesis is based on a single piece of evidence. "
+                "The pattern may not generalize — other code paths may have proper checks."
+            )
+            score -= 0.1
+
+        # Check if hypothesis already has counter-hypotheses
+        if h.counter_hypotheses:
+            score += 0.1  # Self-awareness bonus
+
+        survived = score > 0.0
+        return DebunkResult(
+            attack_name="counter_example_search",
+            survived=survived,
+            score=max(0.0, min(1.0, score)),
+            reasoning=(
+                "Counter-examples found: " + " ; ".join(counter_examples)
+                if counter_examples else "No strong counter-examples found."
+            ),
+            kill_reason=" ; ".join(counter_examples) if not survived else "",
+            suggested_refinement=(
+                "Address counter-examples in the claim or add them as falsifiers. "
+                "Investigate base class and mixin protection patterns."
+            ) if score < 0.6 else "",
+        )
+
+    # ==================================================================
+    # ATTACK 4: Causal Chain Break
+    # ==================================================================
+
+    def causal_chain_break(
+        self, h: Hypothesis, graph: Optional[SemanticGraph] = None, memory: Optional[object] = None
+    ) -> DebunkResult:
+        """
+        Attack 4: Does the causal chain actually hold logically?
+
+        Checks each step in the causal chain for logical gaps, unsupported
+        inferences, or broken reasoning.
+        """
+        score = 1.0
+        breaks = []
+
+        if not h.causal_chain:
+            # No causal chain at all
+            score -= 0.4
+            breaks.append(
+                "No causal chain provided. The claim jumps from observation to "
+                "vulnerability without explaining the mechanism."
+            )
+        elif len(h.causal_chain) < 3:
+            score -= 0.2
+            breaks.append(
+                f"Causal chain has only {len(h.causal_chain)} step(s). "
+                f"A complete chain needs: root cause -> mechanism -> impact."
+            )
+        else:
+            # Check each link in the chain
+            for i, step in enumerate(h.causal_chain):
+                step_lower = step.lower()
+                # Check for vague connector words that mask broken logic
+                vague_connectors = ["somehow", "might", "could possibly", "perhaps"]
+                for vc in vague_connectors:
+                    if vc in step_lower:
+                        score -= 0.2
+                        breaks.append(
+                            f"Causal chain step {i+1} uses vague language ('{vc}'), "
+                            f"indicating an unsupported inference."
+                        )
+
+                # Check for unexplained leaps
+                if i > 0:
+                    prev = h.causal_chain[i-1].lower()
+                    # A leap exists if consecutive steps have no shared concepts
+                    prev_words = set(prev.split())
+                    curr_words = set(step_lower.split())
+                    shared = prev_words & curr_words
+                    if len(shared) == 0 and len(prev_words) > 3 and len(curr_words) > 3:
+                        score -= 0.15
+                        breaks.append(
+                            f"Causal chain step {i+1} shares no concepts with step {i}. "
+                            f"This suggests a logical leap."
+                        )
+
+        survived = score > 0.0
+        return DebunkResult(
+            attack_name="causal_chain_break",
+            survived=survived,
+            score=max(0.0, score),
+            reasoning=" ; ".join(breaks) if breaks else "Causal chain is logically sound with clear step-by-step reasoning.",
+            kill_reason=" ; ".join(breaks) if not survived else "",
+            suggested_refinement=(
+                "Strengthen the causal chain by filling logical gaps. "
+                "Each step should logically follow from the previous one."
+            ) if score < 0.6 else "",
+        )
+
+    # ==================================================================
+    # ATTACK 5: Scope Creep
+    # ==================================================================
+
+    def scope_creep(
+        self, h: Hypothesis, graph: Optional[SemanticGraph] = None, memory: Optional[object] = None
+    ) -> DebunkResult:
+        """
+        Attack 5: Is the claim broader than the evidence supports?
+
+        Checks if confidence exceeds what the evidence actually warrants.
+        Also checks if the claim overgeneralizes from a specific instance.
+        """
+        score = 1.0
+        issues = []
+
+        # Evidence-count vs confidence check
+        evidence_count = len(h.evidence)
+        if evidence_count == 0 and h.confidence > 0.5:
+            score -= 0.3
+            issues.append(
+                f"Confidence is {h.confidence:.2f} but no supporting evidence exists. "
+                f"Confidence should be proportional to evidence strength."
+            )
+        elif evidence_count == 1 and h.confidence > 0.7:
+            score -= 0.2
+            issues.append(
+                f"Confidence is {h.confidence:.2f} based on only 1 piece of evidence. "
+                f"Single-source claims should have confidence <= 0.7."
+            )
+
+        # Check if claim uses universal quantifiers
+        claim_lower = h.claim.lower()
+        universal_terms = ["all ", "every ", "any ", "always ", "never "]
+        for term in universal_terms:
+            if term in claim_lower:
+                score -= 0.15
+                issues.append(
+                    f"Claim uses universal quantifier '{term.strip()}' which overgeneralizes. "
+                    f"Vulnerability claims should be specific about scope."
                 )
-        return None
 
-    # ───────────────────────────────────────────
-    # ATTACK 6: Version Mismatch (IMPLEMENTED)
-    # ───────────────────────────────────────────
-    def _attack_version_mismatch(self, hyp: Hypothesis) -> Optional[DebunkFinding]:
-        """
-        Is the vulnerability already patched in the deployed version?
-        """
-        if not hyp.target_version:
-            return DebunkFinding(
-                attack_vector="version_mismatch",
-                severity=DebunkSeverity.WARNING,
-                reasoning="Target version unknown. Cannot verify if vulnerability is patched.",
-                evidence_required=["Target version fingerprint", "CVE database lookup"],
-                confidence_impact=0.15
+        # Check if attack surface is too broad
+        if len(h.attack_surface) > 5 and evidence_count < 3:
+            score -= 0.15
+            issues.append(
+                f"Claim affects {len(h.attack_surface)} entities but has only "
+                f"{evidence_count} piece(s) of evidence. Scope may be overstated."
             )
-        
-        # Check if this vulnerability is known to be patched in this version
-        if self._is_version_patched(hyp.vulnerability_id, hyp.target_version):
-            return DebunkFinding(
-                attack_vector="version_mismatch",
-                severity=DebunkSeverity.FATAL,
-                reasoning=f"Vulnerability {hyp.vulnerability_id} was patched in version {hyp.target_version} or earlier.",
-                evidence_required=["Vendor changelog", "Patch commit"],
-                confidence_impact=0.8
-            )
-        return None
 
-    def _is_version_patched(self, vuln_id: str, target_version: str) -> bool:
+        # Differential score vs confidence consistency
+        if h.differential_score > 0 and h.confidence > h.differential_score + 0.3:
+            score -= 0.1
+            issues.append(
+                f"Confidence ({h.confidence:.2f}) significantly exceeds differential score "
+                f"({h.differential_score:.2f}). The gap suggests overconfidence."
+            )
+
+        survived = score > 0.0
+        return DebunkResult(
+            attack_name="scope_creep",
+            survived=survived,
+            score=max(0.0, score),
+            reasoning=" ; ".join(issues) if issues else "Claim scope is well-bounded by available evidence.",
+            kill_reason=" ; ".join(issues) if not survived else "",
+            suggested_refinement=(
+                "Reduce confidence to match evidence strength. "
+                "Narrow the claim scope to what is directly supported."
+            ) if score < 0.6 else "",
+        )
+
+    # ==================================================================
+    # ATTACK 6: Confirmation Bias
+    # ==================================================================
+
+    def confirmation_bias(
+        self, h: Hypothesis, graph: Optional[SemanticGraph] = None, memory: Optional[object] = None
+    ) -> DebunkResult:
         """
-        Placeholder: Query CVE database and vendor changelogs.
+        Attack 6: Was the evidence selectively gathered?
+
+        Checks if only confirming evidence was collected, ignoring
+        disconfirming signals.
         """
-        # In production, this would query NVD, vendor APIs, or a local cache
-        patched_versions = {
-            "CVE-2023-12345": "1.2.3",
-            "CVE-2024-67890": "2.0.0",
+        score = 1.0
+        issues = []
+
+        # Check evidence diversity
+        if h.evidence:
+            evidence_sources = set()
+            evidence_types = set()
+            for ev in h.evidence:
+                evidence_sources.add(ev.source.value if hasattr(ev.source, 'value') else str(ev.source))
+                evidence_types.add(ev.evidence_type.value if hasattr(ev.evidence_type, 'value') else str(ev.evidence_type))
+
+            if len(evidence_sources) == 1:
+                score -= 0.2
+                issues.append(
+                    f"All evidence comes from a single source: {evidence_sources}. "
+                    f"This suggests selective gathering from one analysis angle."
+                )
+
+            if len(evidence_types) == 1:
+                score -= 0.15
+                issues.append(
+                    f"All evidence is of one type: {evidence_types}. "
+                    f"Multi-type evidence (AST + graph + differential) is stronger."
+                )
+
+        # Check if counter-hypotheses were generated
+        if not h.counter_hypotheses:
+            score -= 0.15
+            issues.append(
+                "No counter-hypotheses were generated. A thorough analysis should "
+                "consider alternative explanations for the observed differential."
+            )
+
+        # Check for confirmation-biased language in the claim
+        claim_lower = h.claim.lower()
+        bias_count = sum(1 for indicator in self._BIAS_INDICATORS if indicator in claim_lower)
+        if bias_count >= 2:
+            score -= 0.15
+            issues.append(
+                f"Claim contains {bias_count} confirmation-bias indicators. "
+                f"Neutral, specific language is more credible."
+            )
+
+        # Check if falsifiers were actively sought or just defaults
+        if h.falsifiers and all("missed during" in f.lower() for f in h.falsifiers):
+            score -= 0.1
+            issues.append(
+                "All falsifiers are about analysis limitations rather than "
+                "genuine conditions that would disprove the claim."
+            )
+
+        survived = score > 0.0
+        return DebunkResult(
+            attack_name="confirmation_bias",
+            survived=survived,
+            score=max(0.0, score),
+            reasoning=" ; ".join(issues) if issues else "Evidence gathering appears balanced with diverse sources.",
+            kill_reason=" ; ".join(issues) if not survived else "",
+            suggested_refinement=(
+                "Gather evidence from multiple sources (AST, graph, differential). "
+                "Generate counter-hypotheses and use specific, testable falsifiers."
+            ) if score < 0.6 else "",
+        )
+
+    # ==================================================================
+    # ATTACK 7: Temporal Validity
+    # ==================================================================
+
+    def temporal_validity(
+        self, h: Hypothesis, graph: Optional[SemanticGraph] = None, memory: Optional[object] = None
+    ) -> DebunkResult:
+        """
+        Attack 7: Is this still valid given the current code?
+
+        Checks if the hypothesis references patterns that may have changed,
+        or if the code has been modified since analysis.
+        """
+        score = 1.0
+        issues = []
+
+        # Check if target_version is specified
+        if not h.target_version:
+            score -= 0.1
+            issues.append(
+                "No target version specified. The hypothesis may not be valid "
+                "against the current code version."
+            )
+
+        # Check if file_path exists and was recently parsed
+        if h.file_path:
+            import os
+            if not os.path.exists(h.file_path):
+                score -= 0.3
+                issues.append(
+                    f"Referenced file '{h.file_path}' does not exist. "
+                    f"The vulnerability may have been moved or removed."
+                )
+
+        # Check if the hypothesis is based on patterns that are commonly refactored
+        claim_lower = h.claim.lower()
+        transient_patterns = ["todo", "fixme", "hack", "temporary", "workaround"]
+        for pattern in transient_patterns:
+            if pattern in claim_lower:
+                score -= 0.2
+                issues.append(
+                    f"Claim references '{pattern}' pattern, which is likely "
+                    f"to be refactored and may not represent a persistent vulnerability."
+                )
+
+        survived = score > 0.0
+        return DebunkResult(
+            attack_name="temporal_validity",
+            survived=survived,
+            score=max(0.0, score),
+            reasoning=" ; ".join(issues) if issues else "Hypothesis references current, versioned code.",
+            kill_reason=" ; ".join(issues) if not survived else "",
+            suggested_refinement=(
+                "Specify the target version. Verify the file still exists."
+            ) if score < 0.6 else "",
+        )
+
+    # ==================================================================
+    # ATTACK 8: Semantic Drift
+    # ==================================================================
+
+    def semantic_drift(
+        self, h: Hypothesis, graph: Optional[SemanticGraph] = None, memory: Optional[object] = None
+    ) -> DebunkResult:
+        """
+        Attack 8: Have the terms shifted meaning in the claim?
+
+        Checks if key terms (auth, ownership, authorization, etc.) are used
+        consistently between the claim, evidence, and causal chain.
+        """
+        score = 1.0
+        issues = []
+
+        # Define key security terms and their expected context
+        term_contexts = {
+            "authorization": ["role", "permission", "privilege", "access", "policy"],
+            "authentication": ["identity", "login", "session", "token", "credential"],
+            "ownership": ["belongs", "owner", "creator", "user_id", "created_by"],
+            "guard": ["check", "validate", "verify", "precondition", "condition"],
         }
-        return patched_versions.get(vuln_id) == target_version
 
-    # ───────────────────────────────────────────
-    # ATTACK 7: Context Irrelevance
-    # ───────────────────────────────────────────
-    def _attack_context_irrelevance(self, hyp: Hypothesis) -> Optional[DebunkFinding]:
-        context_keywords = ["test", "spec", "mock", "fixture", "example", "demo"]
-        for kw in context_keywords:
-            if kw in str(hyp.file_path).lower():
-                return DebunkFinding(
-                    attack_vector="context_irrelevance",
-                    severity=DebunkSeverity.CRITICAL,
-                    reasoning=f"Code is in a {kw} file. Not production code.",
-                    evidence_required=["Production code path confirmation"],
-                    confidence_impact=0.6
+        claim_lower = h.claim.lower()
+        for term, expected_context in term_contexts.items():
+            if term not in claim_lower:
+                continue
+
+            # Check if the claim uses the term in a context consistent with its meaning
+            context_matches = sum(1 for ctx in expected_context if ctx in claim_lower)
+            if context_matches == 0:
+                score -= 0.2
+                issues.append(
+                    f"Term '{term}' appears in the claim but without expected context "
+                    f"words ({expected_context[:3]}). This may indicate semantic drift."
                 )
-        return None
 
-    # ───────────────────────────────────────────
-    # ATTACK 8: Duplicate or Known (IMPLEMENTED)
-    # ───────────────────────────────────────────
-    def _attack_duplicate_or_known(self, hyp: Hypothesis) -> Optional[DebunkFinding]:
+        # Check consistency between claim and intent/implementation references
+        if h.intent_model_ref and h.implementation_model_ref:
+            intent_words = set(h.intent_model_ref.lower().split())
+            impl_words = set(h.implementation_model_ref.lower().split())
+            claim_words = set(claim_lower.split())
+
+            # Key terms in claim should appear in either intent or impl refs
+            key_terms = ["auth", "ownership", "check", "guard", "role", "permission"]
+            for term in key_terms:
+                if term in claim_lower:
+                    if term not in intent_words and term not in impl_words:
+                        score -= 0.1
+                        issues.append(
+                            f"Term '{term}' in claim but not in intent or implementation references. "
+                            f"The claim may be introducing concepts not present in the analysis."
+                        )
+
+        survived = score > 0.0
+        return DebunkResult(
+            attack_name="semantic_drift",
+            survived=survived,
+            score=max(0.0, score),
+            reasoning=" ; ".join(issues) if issues else "Terms are used consistently across claim, evidence, and causal chain.",
+            kill_reason=" ; ".join(issues) if not survived else "",
+            suggested_refinement=(
+                "Ensure key security terms are used with their standard meaning. "
+                "Align claim terminology with the underlying analysis."
+            ) if score < 0.6 else "",
+        )
+
+    # ==================================================================
+    # ATTACK 9: Attack Surface Mismatch
+    # ==================================================================
+
+    def attack_surface_mismatch(
+        self, h: Hypothesis, graph: Optional[SemanticGraph] = None, memory: Optional[object] = None
+    ) -> DebunkResult:
         """
-        Has this vulnerability already been discovered or submitted?
+        Attack 9: Does this actually affect security?
+
+        The final gate. Even if all other attacks pass, this checks whether
+        the differential actually leads to an exploitable vulnerability or
+        is just a code quality issue.
         """
-        if self.memory and self.memory.is_known(hyp):
-            return DebunkFinding(
-                attack_vector="duplicate_or_known",
-                severity=DebunkSeverity.FATAL,
-                reasoning="This vulnerability pattern has been submitted before.",
-                evidence_required=["Previous submission ID", "Duplicate confirmation"],
-                confidence_impact=1.0
+        score = 0.7  # Start skeptical
+        issues = []
+
+        # Must have a vulnerability class to be security-relevant
+        if not h.vulnerability_class:
+            score -= 0.4
+            issues.append(
+                "No vulnerability class assigned. Without a clear vulnerability "
+                "classification, this may be a code quality issue, not a security issue."
             )
-        
-        # Check if there's a public CVE for this pattern + target
-        if self._is_publicly_known(hyp):
-            return DebunkFinding(
-                attack_vector="duplicate_or_known",
-                severity=DebunkSeverity.CRITICAL,
-                reasoning="A public CVE exists for this vulnerability in this target.",
-                evidence_required=["CVE ID", "Public disclosure link"],
-                confidence_impact=0.7
-            )
-        return None
-
-    def _is_publicly_known(self, hyp: Hypothesis) -> bool:
-        """
-        Placeholder: Query CVE database for target + vulnerability pattern.
-        """
-        # In production: query NVD API, HackerOne disclosure API, etc.
-        return False
-
-    # ───────────────────────────────────────────
-    # ATTACK 9: Exploitability Doubt (IMPLEMENTED)
-    # ───────────────────────────────────────────
-    def _attack_exploitability_doubt(self, hyp: Hypothesis) -> Optional[DebunkFinding]:
-        """
-        Even if technically a bug, can it actually be exploited?
-        """
-        conditions = ["requires_local_admin", "requires_physical_access", "requires_root", "requires_ssrf_chain"]
-        for cond in conditions:
-            if cond in str(hyp.metadata if hasattr(hyp, 'metadata') else {}):
-                return DebunkFinding(
-                    attack_vector="exploitability_doubt",
-                    severity=DebunkSeverity.WARNING,
-                    reasoning=f"Exploitation requires '{cond}', which is unrealistic in most scenarios.",
-                    evidence_required=["Chained exploit proof", "Realistic attack scenario"],
-                    confidence_impact=0.3
+        else:
+            # Check if the vulnerability class is in our target set
+            target_classes = {"idor", "privilege_escalation_horizontal", "privilege_escalation_vertical",
+                             "workflow_bypass", "race_condition", "state_machine_violation"}
+            if h.vulnerability_class.value not in target_classes:
+                score -= 0.3
+                issues.append(
+                    f"Vulnerability class '{h.vulnerability_class.value}' is not in Chimera's target set. "
+                    f"This may be outside the scope of business logic vulnerability analysis."
                 )
-        return None
 
-    # ───────────────────────────────────────────
-    # UTILITY: Summarize Kill Reason
-    # ───────────────────────────────────────────
-    def _summarize_kill(self, findings: List[DebunkFinding]) -> str:
-        if not findings:
-            return "Unknown (no findings recorded)"
-        fatal = [f for f in findings if f.severity == DebunkSeverity.FATAL]
-        critical = [f for f in findings if f.severity == DebunkSeverity.CRITICAL]
-        
-        if fatal:
-            return f"Fatal: {fatal[0].attack_vector} - {fatal[0].reasoning[:100]}"
-        if critical:
-            return f"Critical: {critical[0].attack_vector} - {critical[0].reasoning[:100]}"
-        return f"Multiple weaknesses: {', '.join([f.attack_vector for f in findings[:3]])}"
+        # Check if attack surface leads to an exploitable endpoint
+        if not h.attack_surface:
+            score -= 0.2
+            issues.append(
+                "No attack surface specified. The claim doesn't identify "
+                "which endpoints or functions an attacker would target."
+            )
 
-    def inject_memory(self, memory):
-        """Inject the memory system for duplicate checking."""
-        self.memory = memory
-           
-class DebunkerFeedback:
-    def __init__(self):
-        self.killed_hypotheses = []
-        self.valid_bugs_killed = 0
-        self.false_positives_killed = 0
-    
-    def record_kill(self, hypothesis, triage_outcome):
-        """Compare killed hypothesis to actual triage outcome."""
-        if triage_outcome == "ACCEPTED":
-            self.valid_bugs_killed += 1
-            # Recalibrate: this attack was too aggressive
-        elif triage_outcome == "REJECTED":
-            self.false_positives_killed += 1
-            # This attack is working correctly
+        # Check if the causal chain reaches an exploitable impact
+        if h.causal_chain:
+            last_step = h.causal_chain[-1].lower()
+            impact_words = ["impact", "attacker can", "allows", "enables", "leads to"]
+            if not any(iw in last_step for iw in impact_words):
+                score -= 0.15
+                issues.append(
+                    "Causal chain does not clearly articulate the exploitable impact. "
+                    "The final step should describe what an attacker can achieve."
+                )
+
+        # Check severity assessment
+        if h.severity:
+            sev = h.severity.value if hasattr(h.severity, 'value') else str(h.severity)
+            if sev in {"info", "low"}:
+                score -= 0.1
+                issues.append(
+                    f"Severity assessed as '{sev}'. Low-severity findings may not be "
+                    f"worth the experimentation budget."
+                )
+
+        # Bonus: if the hypothesis has clear prerequisite conditions, it's more credible
+        if len(h.prerequisite_conditions) >= 2:
+            score += 0.1
+        else:
+            issues.append(
+                "Fewer than 2 prerequisite conditions. Exploitability is unclear."
+            )
+
+        survived = score > 0.0
+        return DebunkResult(
+            attack_name="attack_surface_mismatch",
+            survived=survived,
+            score=max(0.0, min(1.0, score)),
+            reasoning=" ; ".join(issues) if issues else "Differential clearly leads to an exploitable security impact.",
+            kill_reason=" ; ".join(issues) if not survived else "",
+            suggested_refinement=(
+                "Clearly identify the attack surface and exploitable impact. "
+                "Ensure the vulnerability class is in the target set."
+            ) if score < 0.6 else "",
+        )
+
+    # ==================================================================
+    # Utilities
+    # ==================================================================
+
+    def _record_attack(self, name: str, result: DebunkResult) -> None:
+        """Record statistics for this attack."""
+        if name not in self.attack_stats:
+            self.attack_stats[name] = {"survived": 0, "killed": 0}
+        if result.survived:
+            self.attack_stats[name]["survived"] += 1
+        else:
+            self.attack_stats[name]["killed"] += 1
+
+    def get_stats(self) -> Dict[str, Any]:
+        """Get debunking statistics."""
+        total = self.total_debunked + self.total_survived
+        return {
+            "total_debunked": self.total_debunked,
+            "total_survived": self.total_survived,
+            "kill_rate": (self.total_debunked / total * 100) if total > 0 else 0,
+            "attack_stats": self.attack_stats,
+        }
