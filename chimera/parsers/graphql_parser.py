@@ -1,66 +1,195 @@
-"""GraphQL intent versus resolver implementation analysis.
-
-The parser deliberately uses a small, dependency-free schema reader.  It is
-not a GraphQL validator; it extracts directive contracts that can be compared
-with Python resolver ASTs.
 """
+GraphQL parser for intent-vs-implementation reasoning.
+
+Extracts:
+- schema field contracts
+- directives such as @auth, @hasRole, @rateLimit
+- resolver naming conventions
+- contradictions where declared intent is not visible in resolver implementation
+"""
+
 from __future__ import annotations
 
 import ast
 import re
-from typing import Dict, List
+import uuid
+from dataclasses import dataclass, field
+from typing import Any, Dict, Iterable, List, Optional
 
-from chimera.models import Evidence, EvidenceSource, EvidenceType
+from chimera.models.evidence import Evidence, EvidenceSource, EvidenceType, ChainOfCustody
+
+
+@dataclass
+class GraphQLFieldContract:
+    type_name: str
+    field_name: str
+    return_type: str = ""
+    directives: List[str] = field(default_factory=list)
+
+    @property
+    def key(self) -> str:
+        return f"{self.type_name}.{self.field_name}"
 
 
 class GraphQLCausalParser:
-    """Build directive contracts and report missing resolver checks."""
+    directive_pattern = re.compile(r"@([A-Za-z_][A-Za-z0-9_]*)")
+    type_block_pattern = re.compile(
+        r"(?:type|extend\s+type)\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?:[^{]*)\{(?P<body>.*?)\}",
+        re.DOTALL,
+    )
+    field_pattern = re.compile(
+        r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*(?:\([^)]*\))?\s*:\s*([^@\n]+?)"
+        r"(?P<directives>(?:\s+@[A-Za-z_][A-Za-z0-9_]*(?:\([^)]*\))?)*)\s*(?:#.*)?$",
+        re.MULTILINE,
+    )
 
-    _TYPE_RE = re.compile(r"\btype\s+(\w+)[^{]*\{(.*?)\}", re.DOTALL)
-    _FIELD_RE = re.compile(r"^\s*(\w+)\s*(?:\([^)]*\))?\s*:\s*[\[\]!\w]+(?P<dirs>[^\n]*)")
-    _DIRECTIVE_RE = re.compile(r"@(\w+)")
+    auth_markers = {
+        "auth",
+        "authenticated",
+        "hasRole",
+        "requiresRole",
+        "permission",
+        "requiresPermission",
+        "rateLimit",
+    }
 
-    def __init__(self) -> None:
-        self.schema_directives: Dict[str, List[str]] = {}
-        self.resolver_implementations: Dict[str, ast.AST] = {}
+    implementation_auth_terms = {
+        "check_auth",
+        "authorize",
+        "authorization",
+        "permission",
+        "has_role",
+        "require_role",
+        "verify_token",
+        "is_authenticated",
+        "current_user",
+        "jwt",
+        "session",
+    }
 
-    def parse_schema(self, schema_content: str) -> Dict[str, List[str]]:
-        """Extract field directives from ``type`` blocks."""
-        for type_match in self._TYPE_RE.finditer(schema_content):
-            type_name, body = type_match.groups()
-            for line in body.splitlines():
-                field_match = self._FIELD_RE.match(line)
-                if not field_match:
-                    continue
-                directives = self._DIRECTIVE_RE.findall(field_match.group("dirs"))
-                if directives:
-                    self.schema_directives[f"{type_name}.{field_match.group(1)}"] = directives
-        return self.schema_directives
+    def parse_schema(self, schema_content: str) -> Dict[str, GraphQLFieldContract]:
+        contracts: Dict[str, GraphQLFieldContract] = {}
 
-    def parse_resolvers(self, ast_tree: ast.AST) -> Dict[str, ast.AST]:
-        """Index resolver functions using ``Type_field_resolver`` naming."""
-        for node in ast.walk(ast_tree):
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.endswith("_resolver"):
-                key = node.name[: -len("_resolver")].replace("_", ".", 1)
-                self.resolver_implementations[key] = node
-        return self.resolver_implementations
+        for type_match in self.type_block_pattern.finditer(schema_content):
+            type_name = type_match.group(1)
+            body = type_match.group("body")
 
-    def generate_contradictions(self) -> List[Evidence]:
-        """Return evidence for protected fields whose resolver has no auth call."""
-        findings: List[Evidence] = []
-        for field_key, directives in self.schema_directives.items():
-            if not {"auth", "hasRole", "requiresAuth"}.intersection(directives):
+            for field_match in self.field_pattern.finditer(body):
+                field_name = field_match.group(1)
+                return_type = field_match.group(2).strip()
+                directive_blob = field_match.group("directives") or ""
+                directives = self.directive_pattern.findall(directive_blob)
+
+                contract = GraphQLFieldContract(
+                    type_name=type_name,
+                    field_name=field_name,
+                    return_type=return_type,
+                    directives=directives,
+                )
+                contracts[contract.key] = contract
+
+        return contracts
+
+    def map_python_resolvers(self, tree: ast.AST) -> Dict[str, ast.AST]:
+        """
+        Map Python resolver function names to GraphQL Type.field keys.
+
+        Supported conventions:
+        - resolve_User_email
+        - User_email_resolver
+        - user_email_resolver
+        - resolve_email on classes named UserResolver or User
+        """
+        resolvers: Dict[str, ast.AST] = {}
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef):
+                key = self._resolver_key_from_function(node.name)
+                if key:
+                    resolvers[key] = node
+
+            if isinstance(node, ast.ClassDef):
+                type_name = node.name.replace("Resolver", "")
+                for child in node.body:
+                    if isinstance(child, ast.FunctionDef) and child.name.startswith("resolve_"):
+                        field = child.name.replace("resolve_", "", 1)
+                        resolvers[f"{type_name}.{field}"] = child
+
+        return resolvers
+
+    def find_contradictions(
+        self,
+        contracts: Dict[str, GraphQLFieldContract],
+        resolvers: Dict[str, ast.AST],
+    ) -> List[Evidence]:
+        evidence: List[Evidence] = []
+
+        for key, contract in contracts.items():
+            guarded = any(d in self.auth_markers for d in contract.directives)
+            if not guarded:
                 continue
-            resolver = self.resolver_implementations.get(field_key)
+
+            resolver = resolvers.get(key)
             if resolver is None:
-                continue
-            calls = {n.func.id for n in ast.walk(resolver) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
-            if not {"check_auth", "verify_token", "authorize", "require_auth"}.intersection(calls):
-                findings.append(Evidence(
-                    source=EvidenceSource.STATIC_ANALYSIS,
-                    evidence_type=EvidenceType.DATA_FLOW,
-                    data={"field": field_key, "directives": directives},
-                    confidence=0.95,
-                    description=f"Schema mandates {directives} for {field_key}, but its resolver has no authorization check.",
+                evidence.append(self._evidence(
+                    key=key,
+                    description=f"GraphQL field {key} declares security directives {contract.directives}, but no resolver mapping was found.",
+                    data={"contract": contract.__dict__, "contradiction": "missing_resolver"},
+                    confidence=0.7,
                 ))
-        return findings
+                continue
+
+            implementation = ast.dump(resolver).lower()
+            has_auth_logic = any(term.lower() in implementation for term in self.implementation_auth_terms)
+
+            if not has_auth_logic:
+                evidence.append(self._evidence(
+                    key=key,
+                    description=f"GraphQL field {key} declares {contract.directives}, but resolver implementation lacks visible authorization checks.",
+                    data={"contract": contract.__dict__, "contradiction": "missing_auth_check"},
+                    confidence=0.85,
+                ))
+
+        return evidence
+
+    def analyze_python_resolvers(self, schema_content: str, python_source: str) -> List[Evidence]:
+        contracts = self.parse_schema(schema_content)
+        tree = ast.parse(python_source)
+        resolvers = self.map_python_resolvers(tree)
+        return self.find_contradictions(contracts, resolvers)
+
+    def _resolver_key_from_function(self, name: str) -> Optional[str]:
+        if name.startswith("resolve_"):
+            parts = name.replace("resolve_", "", 1).split("_")
+            if len(parts) >= 2:
+                return f"{parts[0]}.{parts[1]}"
+            return None
+
+        if name.endswith("_resolver"):
+            parts = name.replace("_resolver", "").split("_")
+            if len(parts) >= 2:
+                return f"{parts[0]}.{parts[1]}"
+
+        return None
+
+    def _evidence(self, key: str, description: str, data: Dict[str, Any], confidence: float) -> Evidence:
+        chain = ChainOfCustody()
+        ev_id = f"EVD-{uuid.uuid4().hex[:10].upper()}"
+        chain.add_step(
+            tool="GraphQLCausalParser",
+            action="intent_implementation_diff",
+            input_ref=key,
+            output_ref=ev_id,
+            parameters={"field": key},
+        )
+        chain.finalize()
+
+        return Evidence(
+            source=EvidenceSource.DIFFERENTIAL_ENGINE,
+            evidence_type=EvidenceType.DIFFERENTIAL_RESULT,
+            data=data,
+            chain_of_custody=chain,
+            confidence=confidence,
+            description=description,
+            metadata={"parser": "graphql", "field": key},
+        )
