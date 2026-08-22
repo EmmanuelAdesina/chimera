@@ -50,6 +50,10 @@ class ChimeraOrchestrator:
     """
 
     def __init__(self, config: Optional[AnalysisConfig] = None) -> None:
+        # Optional extensions are initialized safely and idempotently so core
+        # analysis remains usable when Tree-sitter is not installed.
+        from chimera.core.asi_runtime_patch import initialize_asi_extensions
+        initialize_asi_extensions()
         self.state = WorldState(config=config or AnalysisConfig())
         self.graph = SemanticGraph()
         self.intent_model = IntentModel()
