@@ -1,41 +1,173 @@
-﻿# Chimera
+<div align="center">
 
-CHIMERA is a scientific reasoning engine for offensive security. It constructs falsifiable hypotheses about software systems, actively gathers evidence through controlled execution, updates beliefs using structured reasoning, and produces defensible security findings.
+# 🐉 CHIMERA
 
-**Causal Security Reasoning Engine**
+**A closed-loop causal reasoning engine for offensive security.**
+*It does not match signatures. It falsifies assumptions.*
 
-Finds violated security assumptions by modeling parser cascades, grammar differentials, and intent-vs-implementation contradictions.
+![Python](https://img.shields.io/badge/python-3.11%2B-blue?style=for-the-badge)
+![Tests](https://img.shields.io/badge/integration%20tests-9%2F9%20passing-brightgreen?style=for-the-badge)
+![Core](https://img.shields.io/badge/core-6%2C600%2B%20LOC-orange?style=for-the-badge)
+![Status](https://img.shields.io/badge/status-v2.0%20%2B%20swarm%20plane-red?style=for-the-badge)
 
-## The Reasoning Loop
+**Your scanner has a signature list. Chimera has a scientific method.**
 
-1. **Observe** â€” Gather raw target data
-2. **Model** â€” Build parser cascades and system models
-3. **Hypothesize** â€” Generate falsifiable claims
-4. **Interrogate** â€” Skeptic challenges each hypothesis
-5. **Test** â€” Gather evidence via execution adapters
-6. **Update** â€” Revise confidence based on observations
-7. **Decide** â€” Confirm, reject, or iterate
-8. **Remember** â€” Store everything in structured memory
+</div>
 
-## Quick Start
+---
 
-`powershell\n.\\scripts\\setup.ps1\nmake test\npython -m chimera analyze\n`
+> Chimera models what your software *claims* to do, diffs it against what your
+> code *actually* does, and then attacks the difference — with falsifiable
+> hypotheses, controlled experiments, calibrated belief updates, and a
+> cryptographic chain of custody on every single claim.
 
-## Structure
+---
 
-| Path | Purpose |
-|------|---------|
-| chimera/core/ | Causal engine, epistemic monitor, memory, orchestrator |
-| chimera/models/ | Pydantic models: Hypothesis, Evidence, Grammar |
-| chimera/parsers/ | Parser cascade builders |
-| chimera/execution/ | Capability-based execution adapters |
-| chimera/plugins/ | Drop-in extensions |
-| 	ests/ | Unit + integration tests |
+## ⚡ Why Chimera Exists
 
-## The Core Insight
+Signature scanners memorize the past. Fuzzers stumble through the dark.
+Chimera instead behaves like a hostile scientist:
 
-> The developer thinks there is one language. The machine is actually processing several languages in sequence.
+1. **Observe** the target through a cascade of deep parsers.
+2. **Model** declared intent vs. real implementation as graphs.
+3. **Hypothesize** falsifiable claims about violated security assumptions.
+4. **Interrogate** every claim with a hostile Debunker.
+5. **Test** via a bounded autonomous swarm of execution agents.
+6. **Update** beliefs with Brier-calibrated epistemic scoring.
+7. **Decide** — confirm, refute, or iterate.
+8. **Remember** everything in a decaying hybrid memory moat.
 
-Chimera models each boundary, computes grammar differentials, and proves where trust assumptions break.
+```mermaid
+flowchart LR
+    O["1 · OBSERVE"] --> M["2 · MODEL"]
+    M --> H["3 · HYPOTHESIZE"]
+    H --> I["4 · INTERROGATE"]
+    I --> T["5 · TEST<br/>swarm fan-out"]
+    T --> U["6 · UPDATE"]
+    U --> D{"7 · DECIDE"}
+    D -->|iterate| H
+    D -->|confirm| R["8 · REMEMBER"]
+    R --> O
+```
 
-## License\nMIT
+---
+
+## 🧬 The Three Doctrines
+
+| Doctrine | Meaning |
+|---|---|
+| **The Debunker is the Gatekeeper** | No hypothesis survives without enduring a hostile adversary. 9+ implemented attack vectors act as falsification instruments. |
+| **Memory is the Moat** | ChromaDB vector embeddings + BM25-style sparse retrieval + temporal decay. Every target analyzed makes the next analysis sharper. |
+| **Evidence is the Currency** | AST nodes, HTTP traces, runtime observations — every artifact carries an immutable, SHA-256-fingerprinted chain of custody. Unverifiable claims do not exist. |
+
+---
+
+## 🎯 What It Hunts
+
+- **IDOR** — insecure direct object references via data-flow differentials
+- **Horizontal / Vertical Privilege Escalation**
+- **Workflow Bypasses** — state-machine extraction and illegal transitions
+- **Race Conditions** — including async TOCTOU across await boundaries
+- **State Machine Violations**
+- **Intent-vs-Implementation Contradictions** — GraphQL `@auth` declared, resolver check absent
+
+---
+
+## 🧠 Architecture, In One Breath
+
+Deep parser cascade (Python AST · SQL DDL · GraphQL intent · JS async-state)
+feeds a **causal differential engine** that converts intent/implementation
+contradictions into hypotheses. A **swarm execution plane** — terminal layer,
+headless browser layer, and persistent tool sensors like **Caido** — runs
+bounded falsification experiments, and a **hybrid epistemic memory** decays
+stale beliefs so long autonomous operations stay calibrated.
+
+📐 Full diagrams: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) ·
+🐝 Swarm design: [`docs/SWARM_ARCHITECTURE.md`](docs/SWARM_ARCHITECTURE.md)
+
+---
+
+## 🧩 Plugin Ecosystem
+
+Chimera treats external tools as **epistemic sensors**, not products:
+
+- **CaidoBridge** — persistent GraphQL sensor for HTTP observation & replay
+- **SARIFExporter** — chain-of-custody-preserving SARIF 2.1.0 findings export
+- **ToolPlugin ABC** — bring your own sensor in ~30 lines
+
+---
+
+## 🚀 Quickstart
+
+```bash
+git clone https://github.com/emmanuelAdesina/chimera
+cd chimera
+pip install chromadb aiohttp playwright
+playwright install chromium
+python -m compileall chimera
+python -m unittest discover tests -v
+```
+
+Dispatch your first swarm:
+
+```python
+import asyncio
+from chimera.execution.swarm_bootstrap import build_default_swarm
+from chimera.execution.swarm_coordinator import SwarmTask
+
+async def main():
+    swarm = await build_default_swarm(
+        workspace_root=".",
+        allowed_hosts=["localhost"],   # explicit authorization scope
+    )
+    results = await swarm.dispatch_swarm([
+        SwarmTask(capability="terminal.execute",
+                  payload={"argv": ["python", "--version"], "cwd": "."}),
+    ])
+    print([r.status for r in results])
+    await swarm.stop()
+
+asyncio.run(main())
+```
+
+---
+
+## 🗂️ Repository Map
+
+```
+chimera/
+├─ core/        # orchestrator, causal engine, epistemic monitor, memory
+├─ models/      # Hypothesis, Evidence, chain-of-custody contracts
+├─ parsers/     # python AST · SQL DDL · GraphQL intent · JS async-state
+├─ execution/   # SwarmCoordinator, capability registry, bootstrap
+├─ layers/      # policy-sandboxed terminal · headless browser
+├─ plugins/     # CaidoBridge · SARIFExporter · ToolPlugin ABC
+└─ tests/       # reasoning-loop integration tests
+```
+
+---
+
+## 🛣️ Roadmap
+
+- [ ] Distributed swarm substrate (Redis Streams / NATS / Ray)
+- [ ] VEX export alongside SARIF
+- [ ] Mutation-testing CI (mutmut) + strict mypy gate
+- [ ] Additional parser cascades (Solidity, gRPC/protobuf)
+- [ ] Cross-operation federated memory with differential privacy
+
+---
+
+## ⚖️ Responsible Use
+
+Chimera is a **security research and authorized-testing instrument**.
+Deploy it only against systems you own or are explicitly contracted to test.
+Every execution layer enforces explicit scope allowlists; capability without
+authorization is outside the design envelope.
+
+---
+
+<div align="center">
+
+**If Chimera sharpened your reasoning, leave a ⭐ — the moat grows with every analyst.**
+
+</div>
