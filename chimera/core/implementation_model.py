@@ -156,9 +156,15 @@ class ImplementationModel:
                 confidence=0.85, source=f"graph_traversal:{node.name}",
             )
 
-        # Check for ownership via data flow analysis
+        # Check for ownership via data flow analysis.
+        # Create-style functions legitimately have no ownership check — the
+        # resource does not exist yet, so there is no owner to compare against.
         has_ownership = self._check_ownership_via_graph(node, graph)
-        if not has_ownership and self._has_resource_id_parameter(node):
+        if (
+            not has_ownership
+            and self._has_resource_id_parameter(node)
+            and not self._is_creation_function(node)
+        ):
             self._add_observation(
                 entity_id=node.id, entity_name=node.name,
                 observation_type="no_ownership",
@@ -185,6 +191,23 @@ class ImplementationModel:
                 confidence=0.75, source=f"state_analysis:{node.name}",
             )
 
+        # Grammar differential: string-built SQL without parameterization
+        sql_taint = props.get("sql_taint", [])
+        if sql_taint and not props.get("sql_parameterized"):
+            first = sql_taint[0]
+            self._add_observation(
+                entity_id=node.id, entity_name=node.name,
+                observation_type="unsafe_sql",
+                description=(
+                    f"Function '{node.name}' builds SQL by string interpolation "
+                    f"({first['kind']} at line {first['line']}, values "
+                    f"{first.get('interpolated', [])[:3]}) with no parameterized "
+                    f"execute() call — an attacker-controlled value crosses the "
+                    f"Python-str/SQL-literal grammar boundary unsanitized."
+                ),
+                confidence=0.85, source=f"grammar_differential:{node.name}",
+            )
+
     def _analyze_endpoint(self, node: GraphNode, graph: SemanticGraph) -> None:
         """Analyze an endpoint -- same as function plus route-specific checks."""
         self._analyze_function(node, graph)
@@ -209,21 +232,37 @@ class ImplementationModel:
     # ------------------------------------------------------------------
 
     def _check_auth_via_graph(self, node: GraphNode, graph: SemanticGraph) -> bool:
-        """Check for authorization via graph edge traversal."""
+        """Check for authorization via graph edge traversal AND inline checks."""
         from chimera.core.semantic_graph import EdgeType
 
-        # Check incoming DECORATES/AUTHORIZES edges
+        # 1. Parser-emitted inline guards — `if not user.is_admin: raise ...`,
+        #    `current_user.get("role")`, guard-by-exception. This is what makes
+        #    guarded code distinguishable from unguarded code.
+        if node.properties.get("auth_checks"):
+            return True
+        if "auth_checked" in getattr(node, "semantic_tags", set()):
+            return True
+
+        # 2. Incoming AUTHORIZES / GUARDS edges are created by the parser only
+        #    for auth-classified decorators — the edge alone is conclusive.
         for edge in graph.get_incoming_edges(node.id):
-            if edge.edge_type in {EdgeType.DECORATES, EdgeType.AUTHORIZES, EdgeType.GUARDS}:
+            if edge.edge_type in {EdgeType.AUTHORIZES, EdgeType.GUARDS}:
+                return True
+            if edge.edge_type == EdgeType.DECORATES:
                 src = graph.get_node(edge.source_id)
                 if src:
                     src_name = src.name.lower()
+                    if src.properties.get("is_auth"):
+                        return True
                     for pattern_list in self._AUTH_CHECK_PATTERNS.values():
                         for pattern in pattern_list:
                             if pattern in src_name:
                                 return True
+                    # Well-known auth decorators that carry no pattern token
+                    if any(kw in src_name for kw in ("login", "auth", "permission", "role")):
+                        return True
 
-        # Check outgoing CALLS edges to auth-related functions
+        # 3. Outgoing CALLS edges to auth-related functions
         for edge in graph.get_outgoing_edges(node.id):
             if edge.edge_type == EdgeType.CALLS:
                 target = graph.get_node(edge.target_id)
@@ -233,8 +272,7 @@ class ImplementationModel:
                         if pattern in target_name:
                             return True
 
-        # Check if any CALLED function transitively calls auth
-        # (depth-limited to avoid infinite recursion)
+        # 4. Transitively-called auth (depth 2)
         for edge in graph.get_outgoing_edges(node.id):
             if edge.edge_type == EdgeType.CALLS:
                 target = graph.get_node(edge.target_id)
@@ -250,6 +288,17 @@ class ImplementationModel:
 
         return False
 
+    # Token sets for ownership-comparison detection. Whole-token matching
+    # (attribute/subscript boundaries) so `username` does not read as `user`.
+    _OWNERSHIP_SIDE_TOKENS = {
+        "owner", "owner_id", "user", "user_id", "created_by", "creator",
+        "author", "author_id", "account", "account_id", "tenant", "tenant_id",
+    }
+    _IDENTITY_SIDE_TOKENS = {
+        "user", "current_user", "auth_user", "request", "session",
+        "identity", "principal", "actor", "caller", "me",
+    }
+
     def _check_ownership_via_graph(self, node: GraphNode, graph: SemanticGraph) -> bool:
         """Check for ownership verification via data flow graph traversal."""
         from chimera.core.semantic_graph import EdgeType
@@ -264,26 +313,33 @@ class ImplementationModel:
                         if pattern in tname:
                             return True
 
-        # Check for comparison operations on user/owner identifiers
-        # Look at the function's body for Compare nodes comparing user IDs
-        body_nodes = node.properties.get("body_nodes", [])
-        for bnode in body_nodes:
-            if bnode.get("node_type") == "Compare":
-                # A comparison exists -- check if it involves user/owner identifiers
-                comparators = bnode.get("comparators", [])
-                left = bnode.get("left", {})
-                all_parts = str(left) + " ".join(str(c) for c in comparators)
-                if any(kw in all_parts.lower() for kw in
-                       ["user", "owner", "created_by", "author"]):
-                    return True
+        def _comparison_is_ownership(record: Any) -> bool:
+            left = str(record.get("left", ""))
+            comparators = [str(c) for c in record.get("comparators", [])]
+            import re as _re
+            sides = [left, *comparators]
+            token_sets = []
+            for side in sides:
+                toks = set(t for t in _re.split(r"[\.\[\]\(\)'\s\"]+", side.lower()) if t)
+                token_sets.append(toks)
+            for i in range(len(sides)):
+                for j in range(len(sides)):
+                    if i == j:
+                        continue
+                    if (token_sets[i] & self._OWNERSHIP_SIDE_TOKENS) and (
+                        token_sets[j] & self._IDENTITY_SIDE_TOKENS
+                    ):
+                        return True
+            return False
+
+        # Parser-emitted structural body records
+        for bnode in node.properties.get("body_nodes", []):
+            if bnode.get("node_type") == "Compare" and _comparison_is_ownership(bnode):
+                return True
 
         # Parser-emitted comparison records (python_parser._extract_comparisons)
         for comp in node.properties.get("comparisons", []):
-            all_parts = str(comp.get("left", "")) + " ".join(
-                str(c) for c in comp.get("comparators", [])
-            )
-            if any(kw in all_parts.lower() for kw in
-                   ["user", "owner", "created_by", "author"]):
+            if _comparison_is_ownership(comp):
                 return True
 
         # Parser tags likely ownership comparisons directly
@@ -322,19 +378,64 @@ class ImplementationModel:
                     return True
         return False
 
+    # Actions that create a brand-new resource — no prior owner exists.
+    _CREATION_ACTIONS = {
+        "create", "register", "signup", "init", "initialize", "new",
+        "make", "build",
+    }
+
+    @classmethod
+    def _is_creation_function(cls, node: GraphNode) -> bool:
+        """Whether the function name denotes a create-style action."""
+        name = node.name.lower()
+        parts = name.split("_")
+        return any(part in cls._CREATION_ACTIONS for part in parts) and not any(
+            part in {"delete", "remove", "destroy"} for part in parts
+        )
+
     def _has_resource_id_parameter(self, node: GraphNode) -> bool:
-        """Check if the function takes a resource ID parameter."""
+        """
+        Check if the function takes a *resource* ID parameter.
+
+        A resource identifier looks like ``order_id`` / ``pk`` / ``uuid`` /
+        ``slug`` — it names the object under access. Caller-identity params
+        (``current_user``, ``request``, ``session``, ``user_id``...) are NOT
+        resource identifiers; without this distinction every handler trips the
+        IDOR detector on its own context parameter.
+        """
+        identity_hints = (
+            "user", "current", "request", "session", "auth", "caller",
+            "actor", "self", "cls",
+        )
+        strong_identity_hints = ("current", "request", "session", "actor", "caller", "auth_user")
         params = node.properties.get("parameters", [])
+        param_names = [p.get("name", "").lower() for p in params]
+        has_strong_identity = any(
+            any(h in pn for h in strong_identity_hints) for pn in param_names if pn
+        )
         for p in params:
             pname = p.get("name", "").lower()
-            ptype = p.get("annotation", "").lower()
-            if any(kw in pname for kw in ["id", "pk", "uuid"]) and                any(kw in pname for kw in ["order", "post", "item", "object", "resource", "doc"]):
+            if not pname or pname in {"self", "cls"}:
+                continue
+            if any(hint in pname for hint in strong_identity_hints):
+                continue  # caller identity — not the resource under access
+            if not has_strong_identity and any(
+                hint in pname for hint in ("user", "owner", "auth")
+            ):
+                continue  # ambiguous identity param, no separate identity param
+            if (
+                pname == "id"
+                or pname.endswith("_id")
+                or pname in {"pk", "uuid", "slug", "key"}
+            ):
                 return True
-            # Also check type annotation for model references
-            if "id" in pname and "int" in ptype:
-                return True
-        # Check route for ID parameters
+        # Check route for ID parameters: /orders/<int:order_id>, /users/{id}
         route = node.properties.get("route", "")
-        if "{id}" in route or "<id>" in route or "<int:" in route:
-            return True
+        if route and ("<" in route or "{" in route):
+            import re
+            for match in re.finditer(r"[<{]([^>}]+)[>}]", route):
+                segment = match.group(1).lower().split(":")[-1]
+                if (segment == "id" or segment.endswith("_id")
+                        or segment in {"pk", "uuid", "slug", "key", "int"}):
+                    return True
         return False

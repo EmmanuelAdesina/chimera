@@ -65,6 +65,19 @@ class GraphQLCausalParser:
         "current_user",
         "jwt",
         "session",
+        # Role/assertion idioms — `is_admin`, `role ==`, `PermissionError`.
+        "admin",
+        "is_admin",
+        "is_staff",
+        "is_superuser",
+        "role",
+        "staff",
+        "superuser",
+        "permissionerror",
+        "permissiondenied",
+        "forbidden",
+        "abort(401",
+        "abort(403",
     }
 
     def parse_schema(self, schema_content: str) -> Dict[str, GraphQLFieldContract]:
@@ -139,8 +152,7 @@ class GraphQLCausalParser:
                 ))
                 continue
 
-            implementation = ast.dump(resolver).lower()
-            has_auth_logic = any(term.lower() in implementation for term in self.implementation_auth_terms)
+            has_auth_logic = self._resolver_has_auth_logic(resolver)
 
             if not has_auth_logic:
                 evidence.append(self._evidence(
@@ -152,10 +164,57 @@ class GraphQLCausalParser:
 
         return evidence
 
+    def _resolver_has_auth_logic(self, resolver: ast.AST) -> bool:
+        """
+        Whether a resolver function actually enforces authorization.
+
+        Walks the body *excluding the docstring* (a comment saying "@auth
+        declared" is not enforcement) and matches auth vocabulary as whole
+        identifier/attribute/keyword tokens — not raw substrings.
+        """
+        if not isinstance(resolver, ast.FunctionDef):
+            return False
+
+        body = resolver.body
+        if (
+            body
+            and isinstance(body[0], ast.Expr)
+            and isinstance(body[0].value, ast.Constant)
+            and isinstance(body[0].value.value, str)
+        ):
+            body = body[1:]  # skip docstring
+
+        tokens: set = set()
+        for stmt in body:
+            for node in ast.walk(stmt):
+                if isinstance(node, ast.Name):
+                    tokens.add(node.id.lower())
+                elif isinstance(node, ast.Attribute):
+                    tokens.add(node.attr.lower())
+                elif isinstance(node, ast.Call):
+                    for arg in node.args:
+                        if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                            tokens.add(arg.value.lower())
+                elif isinstance(node, ast.Constant) and node.value in (401, 403):
+                    return True  # explicit auth-failure status
+                elif isinstance(node, ast.Raise) and node.exc is not None:
+                    exc_text = ast.dump(node.exc).lower()
+                    if any(t in exc_text for t in ("permission", "forbidden", "auth", "denied")):
+                        return True
+
+        terms = {t.lower() for t in self.implementation_auth_terms}
+        # "role"/"admin" as bare words inside string constants were handled
+        # above via tokenization of .get("is_admin")-style calls.
+        return bool(tokens & terms)
+
     def analyze_python_resolvers(self, schema_content: str, python_source: str) -> List[Evidence]:
         contracts = self.parse_schema(schema_content)
         tree = ast.parse(python_source)
         resolvers = self.map_python_resolvers(tree)
+        if not resolvers:
+            # Not a resolver file — reporting "missing resolver" for every
+            # declared field against an unrelated module would be noise.
+            return []
         return self.find_contradictions(contracts, resolvers)
 
     def _resolver_key_from_function(self, name: str) -> Optional[str]:

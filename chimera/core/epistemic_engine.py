@@ -217,6 +217,30 @@ _COUNTER_HYPOTHESIS_TEMPLATES: Dict[VulnerabilityClass, List[Dict[str, str]]] = 
             ),
         },
     ],
+    VulnerabilityClass.INJECTION: [
+        {
+            "claim_pattern": (
+                "The string-built query in {file_path} is not exploitable. The "
+                "interpolated values are validated or escaped before reaching this "
+                "function, so the grammar boundary is never crossed by hostile input."
+            ),
+            "falsifier_pattern": (
+                "A request supplying a quote/escape payload in the interpolated "
+                "parameter alters the executed statement (error-based or union-based "
+                "response confirms grammar crossover)."
+            ),
+        },
+        {
+            "claim_pattern": (
+                "The statement in {file_path} is never executed — it is built for "
+                "logging or display only, so the constructed SQL is inert."
+            ),
+            "falsifier_pattern": (
+                "A runtime trace shows the constructed string reaching an "
+                "execute()/query() call on a live connection."
+            ),
+        },
+    ],
 }
 
 # Fallback templates when the vulnerability class is unknown or not in the map
@@ -281,8 +305,9 @@ class EpistemicEngine:
     def __init__(
         self,
         evidence_weight: float = 0.35,
-        differential_weight: float = 0.30,
-        novelty_weight: float = 0.15,
+        differential_weight: float = 0.25,
+        novelty_weight: float = 0.10,
+        adversarial_weight: float = 0.30,
         learning_rate: float = 0.15,
         min_confidence: float = 0.05,
         max_confidence: float = 0.95,
@@ -293,6 +318,10 @@ class EpistemicEngine:
             evidence_weight: Weight for the evidence strength signal (0-1).
             differential_weight: Weight for the differential score signal (0-1).
             novelty_weight: Weight for the novelty penalty (0-1).
+            adversarial_weight: Weight for the Debunker-survival signal (0-1).
+                Surviving the hostile 9-vector review is genuine Bayesian
+                evidence; hypotheses reviewed before calibration score higher
+                than unreviewed ones.
             learning_rate: EMA alpha for updating calibration bias (0-1).
             min_confidence: Floor for calibrated confidence output.
             max_confidence: Ceiling for calibrated confidence output.
@@ -301,7 +330,7 @@ class EpistemicEngine:
             ValueError: If weights are negative, learning rate is out of range,
                 or min/max confidence are inconsistent.
         """
-        if evidence_weight < 0 or differential_weight < 0 or novelty_weight < 0:
+        if evidence_weight < 0 or differential_weight < 0 or novelty_weight < 0 or adversarial_weight < 0:
             raise ValueError("All signal weights must be non-negative.")
         if not (0.0 < learning_rate <= 1.0):
             raise ValueError("learning_rate must be in (0.0, 1.0].")
@@ -314,6 +343,7 @@ class EpistemicEngine:
         self.evidence_weight: float = evidence_weight
         self.differential_weight: float = differential_weight
         self.novelty_weight: float = novelty_weight
+        self.adversarial_weight: float = adversarial_weight
         self.learning_rate: float = learning_rate
         self.min_confidence: float = min_confidence
         self.max_confidence: float = max_confidence
@@ -369,17 +399,33 @@ class EpistemicEngine:
         evidence_signal = self._compute_evidence_signal(hypothesis)
 
         # --- Signal 2: Differential score ---
-        differential_signal = hypothesis.differential_score
+        differential_signal = max(0.0, min(1.0, hypothesis.differential_score))
 
         # --- Signal 3: Novelty penalty ---
-        novelty_penalty = 0.0 if not hypothesis.is_novel else 0.1
+        novelty_penalty = 0.1 if hypothesis.is_novel else 0.0
 
-        # --- Weighted combination ---
-        raw_confidence = (
-            evidence_signal * self.evidence_weight
-            + differential_signal * self.differential_weight
-            + novelty_penalty * self.novelty_weight
-        )
+        # --- Signal 4: Adversarial survival ---
+        # Surviving the Debunker's hostile review is real Bayesian evidence.
+        # If the hypothesis was reviewed, its overall debunk score feeds in;
+        # unreviewed hypotheses get 0 (neutral, keeps them conservative).
+        adversarial_signal = self._compute_adversarial_signal(hypothesis)
+
+        # --- Weighted combination over ACTIVE signal families ---
+        # Weights renormalize across the signals actually present so that
+        # confidence is a proper weighted mean — not a sum that is
+        # mathematically capped below 1.0 when a signal family is silent.
+        weighted_sum = evidence_signal * self.evidence_weight
+        weight_total = self.evidence_weight
+
+        weighted_sum += differential_signal * self.differential_weight
+        weight_total += self.differential_weight
+
+        if adversarial_signal is not None:
+            weighted_sum += adversarial_signal * self.adversarial_weight
+            weight_total += self.adversarial_weight
+
+        raw_confidence = (weighted_sum / weight_total) if weight_total > 0 else 0.0
+        raw_confidence -= novelty_penalty * self.novelty_weight
 
         # --- Apply learned calibration bias ---
         adjusted = raw_confidence - self.calibration_bias
@@ -389,11 +435,12 @@ class EpistemicEngine:
 
         logger.debug(
             "Calibrated %s: evidence=%.3f, differential=%.3f, novelty=%.3f, "
-            "bias=%.3f => %.3f",
+            "adversarial=%s, bias=%.3f => %.3f",
             hypothesis.id,
             evidence_signal,
             differential_signal,
             novelty_penalty,
+            f"{adversarial_signal:.3f}" if adversarial_signal is not None else "n/a",
             self.calibration_bias,
             calibrated,
         )
@@ -561,6 +608,22 @@ class EpistemicEngine:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _compute_adversarial_signal(self, hypothesis: Hypothesis) -> Optional[float]:
+        """
+        The Debunker-survival signal.
+
+        Reads ``hypothesis.metadata["debunker_overall_score"]`` (set by the
+        orchestrator after the debunking phase). Returns ``None`` when the
+        hypothesis has not been through hostile review — in which case the
+        signal family simply does not participate in the weighted mean.
+        """
+        if not isinstance(hypothesis.metadata, dict):
+            return None
+        score = hypothesis.metadata.get("debunker_overall_score")
+        if isinstance(score, (int, float)):
+            return max(0.0, min(1.0, float(score)))
+        return None
 
     def _compute_evidence_signal(self, hypothesis: Hypothesis) -> float:
         """Compute the evidence strength signal for a hypothesis.

@@ -301,27 +301,56 @@ class SQLParser:
     PostgreSQL, MySQL, and SQLite dialects.
     """
 
+    #: Stable parser identifier.
+    name: str = "sql_ddl"
+
+    #: File extensions this parser handles.
+    extensions: Tuple[str, ...] = (".sql",)
+
     def __init__(self) -> None:
         self._evidence: List[Evidence] = []
+        self.graph: SemanticGraph = SemanticGraph()
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
-    def parse(self, file_path: str, source: str, graph: SemanticGraph) -> List[Evidence]:
+    def parse(
+        self,
+        file_path: str,
+        source: str,
+        graph: Optional[SemanticGraph] = None,
+    ) -> List[Evidence]:
         """
         Parse *source* (SQL DDL text from *file_path*) and populate *graph*.
 
         Returns a list of :class:`Evidence` objects collected during parsing.
+
+        ``source`` may be ``None`` or blank (returns an empty list). ``graph``
+        may be ``None``, in which case the parser populates its own graph,
+        available as ``self.graph`` afterwards.  Malformed DDL never raises —
+        individual statements that fail to parse are skipped and logged.
         """
         self._evidence.clear()
+        if graph is not None and not isinstance(graph, SemanticGraph):
+            raise TypeError(
+                f"graph must be a SemanticGraph instance (or None), got "
+                f"{type(graph).__name__}. Pass SemanticGraph() — a plain dict "
+                f"or networkx.Graph is not compatible with the parser cascade."
+            )
+        target_graph = graph if graph is not None else SemanticGraph()
+        self.graph = target_graph
+
+        if not source or not source.strip():
+            return []
+
         tables = self._extract_tables(source, file_path)
 
         # First pass: create all table nodes so FK edges can reference them.
         table_node_ids: Dict[str, str] = {}
         for table_info in tables:
             node = self._build_table_node(table_info, file_path)
-            nid = graph.add_node(node)
+            nid = target_graph.add_node(node)
             table_node_ids[table_info.name] = nid
 
         # Second pass: create edges (FK DEPENDS_ON, etc.)
@@ -339,24 +368,27 @@ class SQLParser:
                         properties={"external_reference": True},
                         semantic_tags={"external_table"},
                     )
-                    ref_id = graph.add_node(placeholder)
+                    ref_id = target_graph.add_node(placeholder)
 
-                edge = GraphEdge(
-                    source_id=src_id,
-                    target_id=ref_id,
-                    edge_type=EdgeType.DEPENDS_ON,
-                    properties={
-                        "constraint_name": fk.constraint_name,
-                        "columns": fk.columns,
-                        "ref_columns": fk.ref_columns,
-                        "on_delete": fk.on_delete,
-                        "on_update": fk.on_update,
-                        "relationship": "foreign_key",
-                    },
-                    weight=1.0,
-                    semantic_tags={"foreign_key"},
-                )
-                graph.add_edge(edge)
+                try:
+                    edge = GraphEdge(
+                        source_id=src_id,
+                        target_id=ref_id,
+                        edge_type=EdgeType.DEPENDS_ON,
+                        properties={
+                            "constraint_name": fk.constraint_name,
+                            "columns": fk.columns,
+                            "ref_columns": fk.ref_columns,
+                            "on_delete": fk.on_delete,
+                            "on_update": fk.on_update,
+                            "relationship": "foreign_key",
+                        },
+                        weight=1.0,
+                        semantic_tags={"foreign_key"},
+                    )
+                    target_graph.add_edge(edge)
+                except ValueError as exc:
+                    logger.warning("Skipping FK edge in %s: %s", file_path, exc)
 
         return list(self._evidence)
 
@@ -367,135 +399,146 @@ class SQLParser:
     def _extract_tables(self, source: str, file_path: str) -> List[_TableInfo]:
         """Find all CREATE TABLE statements and parse them into _TableInfo."""
         tables: List[_TableInfo] = []
-        lines = source.splitlines()
 
         for match in _RE_CREATE_TABLE.finditer(source):
-            table_name = match.group("table_name")
-            body_text = match.group("body")
-
-            # Compute line range
-            start_line = source[:match.start()].count("\n") + 1
-            end_line = source[:match.end()].count("\n") + 1
-
-            table_info = _TableInfo(
-                name=table_name,
-                line_start=start_line,
-                line_end=end_line,
-                raw_body=body_text,
-            )
-
-            # Strip outer parens and parse the body
-            inner = self._strip_outer_parens(body_text)
-            column_defs = self._split_column_defs(inner)
-
-            for col_text in column_defs:
-                col_text = col_text.strip()
-                if not col_text:
-                    continue
-
-                # Fast check: if the text starts with a known out-of-line
-                # constraint keyword, skip column parsing entirely.
-                first_word = col_text.split()[0].upper() if col_text.split() else ""
-                is_out_of_line = first_word in ("CONSTRAINT", "FOREIGN", "UNIQUE", "PRIMARY", "CHECK")
-
-                # Try as out-of-line FK constraint first
-                fk_match = _RE_FK_CONSTRAINT.search(col_text)
-                if fk_match:
-                    table_info.foreign_keys.append(
-                        self._parse_fk_match(fk_match, start_line)
-                    )
-                    continue
-
-                # Shorthand FK
-                fk_short = _RE_FK_SHORT.search(col_text)
-                if fk_short:
-                    table_info.foreign_keys.append(
-                        self._parse_fk_short_match(fk_short, start_line)
-                    )
-                    continue
-
-                # Out-of-line UNIQUE
-                uq_match = _RE_UNIQUE_CONSTRAINT.search(col_text)
-                if uq_match and is_out_of_line:
-                    table_info.unique_constraints.append(_UniqueConstraint(
-                        name=uq_match.group("name") or "",
-                        columns=self._split_identifier_list(uq_match.group("columns")),
-                    ))
-                    continue
-
-                # Out-of-line PRIMARY KEY
-                pk_match = _RE_PK_CONSTRAINT.search(col_text)
-                if pk_match and is_out_of_line:
-                    table_info.primary_key_columns.extend(
-                        self._split_identifier_list(pk_match.group("columns"))
-                    )
-                    continue
-
-                # Out-of-line CHECK
-                ck_match = _RE_CHECK_CONSTRAINT.search(col_text)
-                if ck_match and is_out_of_line:
-                    table_info.check_constraints.append(_CheckConstraint(
-                        name=ck_match.group("name") or "",
-                        expression=ck_match.group("expr").strip(),
-                    ))
-                    continue
-
-                # Column definition
-                col_info = self._parse_column_def(col_text)
-                if col_info is not None:
-                    table_info.columns.append(col_info)
-                    if col_info.is_primary_key:
-                        table_info.primary_key_columns.append(col_info.name)
-                    if col_info.inline_references:
-                        ref = col_info.inline_references
-                        table_info.foreign_keys.append(_ForeignKeyInfo(
-                            constraint_name="",
-                            columns=[col_info.name],
-                            ref_table=ref["ref_table"],
-                            ref_columns=ref["ref_columns"],
-                            on_delete=ref.get("on_delete", ""),
-                            on_update=ref.get("on_update", ""),
-                        ))
-                    if col_info.is_unique:
-                        table_info.unique_constraints.append(_UniqueConstraint(
-                            name="",
-                            columns=[col_info.name],
-                        ))
-
-            # Collect evidence
-            self._evidence.append(Evidence.from_ast_node(
-                file_path=file_path,
-                node_type="CREATE_TABLE",
-                node_data={
-                    "table_name": table_name,
-                    "columns": [c.name for c in table_info.columns],
-                    "column_types": {c.name: c.data_type for c in table_info.columns},
-                    "primary_key": table_info.primary_key_columns,
-                    "foreign_keys": [
-                        {
-                            "columns": fk.columns,
-                            "ref_table": fk.ref_table,
-                            "ref_columns": fk.ref_columns,
-                        }
-                        for fk in table_info.foreign_keys
-                    ],
-                    "unique_constraints": [
-                        {"name": u.name, "columns": u.columns}
-                        for u in table_info.unique_constraints
-                    ],
-                    "check_constraints": [
-                        {"name": ck.name, "expression": ck.expression}
-                        for ck in table_info.check_constraints
-                    ],
-                },
-                line=start_line,
-                end_line=end_line,
-                description=f"Table {table_name} with {len(table_info.columns)} columns at {file_path}:{start_line}",
-            ))
-
-            tables.append(table_info)
+            try:
+                table_info = self._parse_table_match(match, source, file_path)
+            except Exception as exc:  # malformed DDL never crashes the parser
+                logger.warning("Skipping malformed CREATE TABLE in %s: %s", file_path, exc)
+                continue
+            if table_info is not None:
+                tables.append(table_info)
 
         return tables
+
+    def _parse_table_match(
+        self, match: "re.Match[str]", source: str, file_path: str
+    ) -> Optional[_TableInfo]:
+        """Parse one CREATE TABLE regex match into a _TableInfo (or None)."""
+        table_name = match.group("table_name")
+        body_text = match.group("body")
+
+        # Compute line range
+        start_line = source[:match.start()].count("\n") + 1
+        end_line = source[:match.end()].count("\n") + 1
+
+        table_info = _TableInfo(
+            name=table_name,
+            line_start=start_line,
+            line_end=end_line,
+            raw_body=body_text,
+        )
+
+        # Strip outer parens and parse the body
+        inner = self._strip_outer_parens(body_text)
+        column_defs = self._split_column_defs(inner)
+
+        for col_text in column_defs:
+            col_text = col_text.strip()
+            if not col_text:
+                continue
+
+            # Fast check: if the text starts with a known out-of-line
+            # constraint keyword, skip column parsing entirely.
+            first_word = col_text.split()[0].upper() if col_text.split() else ""
+            is_out_of_line = first_word in ("CONSTRAINT", "FOREIGN", "UNIQUE", "PRIMARY", "CHECK")
+
+            # Try as out-of-line FK constraint first
+            fk_match = _RE_FK_CONSTRAINT.search(col_text)
+            if fk_match:
+                table_info.foreign_keys.append(
+                    self._parse_fk_match(fk_match, start_line)
+                )
+                continue
+
+            # Shorthand FK
+            fk_short = _RE_FK_SHORT.search(col_text)
+            if fk_short:
+                table_info.foreign_keys.append(
+                    self._parse_fk_short_match(fk_short, start_line)
+                )
+                continue
+
+            # Out-of-line UNIQUE
+            uq_match = _RE_UNIQUE_CONSTRAINT.search(col_text)
+            if uq_match and is_out_of_line:
+                table_info.unique_constraints.append(_UniqueConstraint(
+                    name=uq_match.group("name") or "",
+                    columns=self._split_identifier_list(uq_match.group("columns")),
+                ))
+                continue
+
+            # Out-of-line PRIMARY KEY
+            pk_match = _RE_PK_CONSTRAINT.search(col_text)
+            if pk_match and is_out_of_line:
+                table_info.primary_key_columns.extend(
+                    self._split_identifier_list(pk_match.group("columns"))
+                )
+                continue
+
+            # Out-of-line CHECK
+            ck_match = _RE_CHECK_CONSTRAINT.search(col_text)
+            if ck_match and is_out_of_line:
+                table_info.check_constraints.append(_CheckConstraint(
+                    name=ck_match.group("name") or "",
+                    expression=ck_match.group("expr").strip(),
+                ))
+                continue
+
+            # Column definition
+            col_info = self._parse_column_def(col_text)
+            if col_info is not None:
+                table_info.columns.append(col_info)
+                if col_info.is_primary_key:
+                    table_info.primary_key_columns.append(col_info.name)
+                if col_info.inline_references:
+                    ref = col_info.inline_references
+                    table_info.foreign_keys.append(_ForeignKeyInfo(
+                        constraint_name="",
+                        columns=[col_info.name],
+                        ref_table=ref["ref_table"],
+                        ref_columns=ref["ref_columns"],
+                        on_delete=ref.get("on_delete", ""),
+                        on_update=ref.get("on_update", ""),
+                    ))
+                if col_info.is_unique:
+                    table_info.unique_constraints.append(_UniqueConstraint(
+                        name="",
+                        columns=[col_info.name],
+                    ))
+
+        # Collect evidence
+        self._evidence.append(Evidence.from_ast_node(
+            file_path=file_path,
+            node_type="CREATE_TABLE",
+            node_data={
+                "table_name": table_name,
+                "columns": [c.name for c in table_info.columns],
+                "column_types": {c.name: c.data_type for c in table_info.columns},
+                "primary_key": table_info.primary_key_columns,
+                "foreign_keys": [
+                    {
+                        "columns": fk.columns,
+                        "ref_table": fk.ref_table,
+                        "ref_columns": fk.ref_columns,
+                    }
+                    for fk in table_info.foreign_keys
+                ],
+                "unique_constraints": [
+                    {"name": u.name, "columns": u.columns}
+                    for u in table_info.unique_constraints
+                ],
+                "check_constraints": [
+                    {"name": ck.name, "expression": ck.expression}
+                    for ck in table_info.check_constraints
+                ],
+            },
+            line=start_line,
+            end_line=end_line,
+            description=f"Table {table_name} with {len(table_info.columns)} columns at {file_path}:{start_line}",
+        ))
+
+        return table_info
 
     # ------------------------------------------------------------------
     # Column definition parsing

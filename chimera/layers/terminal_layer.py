@@ -40,6 +40,17 @@ class CommandPolicy:
         "mypy", "mypy.exe",
         "bandit", "bandit.exe",
     })
+    # Interpreter families whose inline-code flags bypass the executable
+    # allowlist (`python -c "..."` is a full shell). These flags are blocked
+    # by default; set allow_interpreter_code=True for trusted harnesses.
+    interpreter_executables: set[str] = field(default_factory=lambda: {
+        "python", "python.exe", "py", "python3", "python3.exe",
+        "node", "node.exe",
+    })
+    blocked_interpreter_flags: set[str] = field(default_factory=lambda: {
+        "-c", "--command", "-e", "--eval", "-m", "--module",
+    })
+    allow_interpreter_code: bool = False
     workspace_root: Optional[str] = None
     timeout_seconds: int = 30
     max_output_chars: int = 200_000
@@ -70,6 +81,22 @@ class TerminalLayer:
         executable = Path(str(argv[0])).name
         if executable not in self.policy.allowed_executables:
             raise PermissionError(f"Executable not allowed by policy: {executable}")
+
+        # Close the inline-code escape hatch: an allowlisted interpreter run
+        # with `-c "arbitrary code"` defeats the whole point of the allowlist.
+        if (
+            not self.policy.allow_interpreter_code
+            and executable in self.policy.interpreter_executables
+        ):
+            for arg in argv[1:]:
+                flag = str(arg).split("=", 1)[0]
+                if flag in self.policy.blocked_interpreter_flags:
+                    raise PermissionError(
+                        f"Inline code execution via '{executable} {flag}' is blocked "
+                        f"by policy. Set allow_interpreter_code=True on a hardened "
+                        f"sandbox host to override, or run scripts by path instead "
+                        f"(`{executable} script.py`)."
+                    )
 
         safe_cwd = self._validate_cwd(cwd)
 

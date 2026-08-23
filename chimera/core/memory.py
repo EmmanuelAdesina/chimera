@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime
 import json
 import hashlib
+import os
 import uuid
 
 
@@ -123,6 +124,43 @@ class StructuredMemory:
         key = f"result:{target_path}:{version}"
         return self.get(key)
 
+    # ------------------------------------------------------------------
+    # Hypothesis storage
+    # ------------------------------------------------------------------
+
+    def store_hypothesis(self, hypothesis: Any) -> str:
+        """Store a hypothesis (serialized via ``to_dict()`` when available).
+
+        Supports both ``Hypothesis`` objects and plain dicts. Returns the
+        storage key so callers can reference it later.
+        """
+        if hasattr(hypothesis, "to_dict"):
+            data = hypothesis.to_dict()
+            hyp_id = getattr(hypothesis, "id", None) or data.get("id", "unknown")
+        elif isinstance(hypothesis, dict):
+            data = hypothesis
+            hyp_id = data.get("id", "unknown")
+        else:
+            raise TypeError(
+                f"store_hypothesis expects a Hypothesis or dict, got "
+                f"{type(hypothesis).__name__}"
+            )
+        key = f"hypothesis:{hyp_id}"
+        metadata = {}
+        if data.get("vulnerability_class"):
+            metadata["vulnerability_class"] = data["vulnerability_class"]
+        if data.get("status"):
+            metadata["status"] = data["status"]
+        return self.put(key, data, category="hypothesis", metadata=metadata)
+
+    def get_hypothesis(self, hypothesis_id: str) -> Optional[Dict]:
+        """Retrieve a stored hypothesis dict by its hypothesis ID."""
+        return self.get(f"hypothesis:{hypothesis_id}")
+
+    def list_hypotheses(self) -> List[Dict]:
+        """Return all stored hypothesis dicts."""
+        return [e.value for e in self.get_by_category("hypothesis")]
+
     def _save(self) -> None:
         """Persist to disk."""
         if not self.persist_path:
@@ -174,16 +212,24 @@ class SemanticMemory:
     """
 
     def __init__(self, persist_dir: Optional[str] = None) -> None:
-        self.persist_dir = persist_dir or ".chimera/memory/semantic"
+        # None or ":memory:" => ephemeral (non-persistent) backend.
+        self.persist_dir = persist_dir or ":memory:"
         self._client = None
         self._collection = None
         self._initialized = False
+        self._fallback_store: List[Dict] = []
 
     def initialize(self) -> bool:
         """Initialize ChromaDB client and collection."""
+        if self._initialized:
+            return self._collection is not None
         try:
             import chromadb
-            self._client = chromadb.PersistentClient(path=self.persist_dir)
+            if self.persist_dir == ":memory:":
+                # Ephemeral client — no disk writes.
+                self._client = chromadb.EphemeralClient()
+            else:
+                self._client = chromadb.PersistentClient(path=self.persist_dir)
             self._collection = self._client.get_or_create_collection(
                 name="chimera_patterns",
                 metadata={"hnsw:space": "cosine"},
@@ -191,12 +237,10 @@ class SemanticMemory:
             self._initialized = True
             return True
         except ImportError:
-            # ChromaDB not installed — fall back to in-memory
-            self._fallback_store: List[Dict] = []
+            # ChromaDB not installed — fall back to in-memory keyword search
             self._initialized = True
             return False
-        except Exception as e:
-            self._fallback_store: List[Dict] = []
+        except Exception:
             self._initialized = True
             return False
 
@@ -215,18 +259,12 @@ class SemanticMemory:
                     metadatas=[metadata],
                     ids=[doc_id],
                 )
+                return doc_id
             except Exception:
-                if not hasattr(self, '_fallback_store'):
-                    self._fallback_store = []
-                self._fallback_store.append({
-                    "id": doc_id, "text": text, "metadata": metadata,
-                })
-        else:
-            if not hasattr(self, '_fallback_store'):
-                self._fallback_store = []
-            self._fallback_store.append({
-                "id": doc_id, "text": text, "metadata": metadata,
-            })
+                pass
+        self._fallback_store.append({
+            "id": doc_id, "text": text, "metadata": metadata,
+        })
         return doc_id
 
     def search(self, query: str, n_results: int = 5,
@@ -327,4 +365,134 @@ class SemanticMemory:
             "total_patterns": self.count(),
             "backend": "chromadb" if self._collection else "fallback",
             "persist_dir": self.persist_dir,
+        }
+
+
+# ==================================================================
+# ChimeraMemory — Unified facade over both memory planes
+# ==================================================================
+
+
+class ChimeraMemory:
+    """
+    The public memory API for Chimera.
+
+    Combines the two memory planes behind a single stable interface:
+
+    - ``structured`` (:class:`StructuredMemory`) — exact-lookup store for
+      hypotheses, confirmed patterns, results, and calibration records.
+    - ``semantic`` (:class:`SemanticMemory`) — vector/BM25-style retrieval
+      for structurally similar patterns across targets.
+
+    The orchestrator, causal engine, and debunker all speak to this facade
+    rather than to individual stores, so the plane implementations can
+    evolve without breaking consumers.
+
+    Usage::
+
+        memory = ChimeraMemory()
+        memory.initialize()
+        memory.store_hypothesis(hypothesis)
+        similar = memory.recall_similar("idor ownership check", vuln_class="idor")
+    """
+
+    def __init__(
+        self,
+        persist_dir: Optional[str] = None,
+        structured_path: Optional[str] = None,
+        structured: Optional[StructuredMemory] = None,
+        semantic: Optional[SemanticMemory] = None,
+    ) -> None:
+        # Default is fully in-memory; persistence is opt-in via persist_dir.
+        if structured is not None:
+            self._structured = structured
+        else:
+            self._structured = StructuredMemory(
+                persist_path=structured_path  # None => in-memory only
+            )
+        if semantic is not None:
+            self._semantic = semantic
+        else:
+            self._semantic = SemanticMemory(
+                persist_dir=persist_dir or os.path.join(".chimera", "memory", "semantic")
+            )
+        self._initialized = False
+
+    # ------------------------------------------------------------------
+    # Plane accessors
+    # ------------------------------------------------------------------
+
+    @property
+    def structured(self) -> StructuredMemory:
+        """The structured (exact-lookup) memory plane."""
+        return self._structured
+
+    @property
+    def semantic(self) -> SemanticMemory:
+        """The semantic (similarity) memory plane."""
+        return self._semantic
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    def initialize(self) -> bool:
+        """Initialize both planes. Returns True if semantic backend is live."""
+        semantic_live = self._semantic.initialize()
+        self._initialized = True
+        return semantic_live
+
+    # ------------------------------------------------------------------
+    # Cross-plane operations
+    # ------------------------------------------------------------------
+
+    def store_hypothesis(self, hypothesis: Any) -> str:
+        """Store a hypothesis in BOTH planes (structured + semantic).
+
+        Returns the structured-plane storage key.
+        """
+        if not self._initialized:
+            self.initialize()
+        key = self._structured.store_hypothesis(hypothesis)
+        try:
+            self._semantic.store_hypothesis(hypothesis)
+        except Exception:
+            # Semantic storage is best-effort; structured store is authoritative.
+            pass
+        return key
+
+    def get_hypothesis(self, hypothesis_id: str) -> Optional[Dict]:
+        """Retrieve a hypothesis dict from structured memory."""
+        return self._structured.get_hypothesis(hypothesis_id)
+
+    def recall_similar(
+        self,
+        query: str,
+        n_results: int = 5,
+        vuln_class: Optional[str] = None,
+    ) -> List[Dict]:
+        """Find semantically similar patterns from previous analyses."""
+        if not self._initialized:
+            self.initialize()
+        filter_dict = {"vulnerability_class": vuln_class} if vuln_class else None
+        return self._semantic.search(query, n_results=n_results, filter_dict=filter_dict)
+
+    def store_pattern(self, pattern_data: Dict, vuln_class: str) -> str:
+        """Store a confirmed vulnerability pattern for future novelty checks."""
+        return self._structured.store_pattern(pattern_data, vuln_class)
+
+    def record_result(self, target_path: str, version: str, result: Dict) -> str:
+        """Store a full analysis result for a target+version."""
+        return self._structured.store_result(target_path, version, result)
+
+    def get_result(self, target_path: str, version: str) -> Optional[Dict]:
+        """Retrieve a stored analysis result."""
+        return self._structured.get_result(target_path, version)
+
+    def stats(self) -> Dict[str, Any]:
+        """Combined statistics across both planes."""
+        return {
+            "structured": self._structured.stats(),
+            "semantic": self._semantic.stats(),
+            "initialized": self._initialized,
         }

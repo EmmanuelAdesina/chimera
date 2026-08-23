@@ -61,15 +61,60 @@ class IntentModel:
         "superuser": {"scope": "superuser", "confidence": 0.95},
         "staff": {"scope": "staff", "confidence": 0.8},
     }
+    # Actions that mutate protected state — an unauthenticated caller must
+    # never trigger them, so they imply an auth expectation at minimum.
     _SENSITIVE_ACTIONS = [
         "delete", "update", "create", "approve", "reject",
         "transfer", "cancel", "refund", "assign", "promote",
         "demote", "disable", "enable", "reset", "change_password",
+        "edit", "remove", "destroy", "purge", "grant", "revoke",
+        "invite", "ban", "suspend", "execute", "deploy", "withdraw",
+        "deposit", "charge", "pay", "checkout", "ship", "close",
+        "escalate", "impersonate", "merge", "archive", "restore",
+        "export", "download", "backup", "wipe",
     ]
+    # Read-style actions that expose another user's resource — ownership
+    # expectation applies (IDOR surface) even though no mutation occurs.
+    _READ_ACTIONS = [
+        "get", "fetch", "view", "read", "show", "detail", "retrieve",
+        "list", "lookup", "load",
+    ]
+    # Create-style actions operate on a resource that does not exist yet —
+    # an ownership expectation on them is a false-positive generator.
+    _CREATION_ACTIONS = {
+        "create", "register", "signup", "init", "initialize", "new",
+        "make", "build",
+    }
+    # Parameter names that denote the *resource* being accessed (vs the
+    # caller identity): order_id, post_id, pk, uuid, slug...
+    _RESOURCE_ID_HINTS = ("_id", "id", "pk", "uuid", "slug", "key", "num")
+    # Parameter names that denote the *caller's* identity, never a resource.
+    _IDENTITY_PARAM_HINTS = (
+        "user", "current", "request", "session", "auth", "caller",
+        "actor", "self", "cls",
+    )
     _AUTH_DECORATORS = [
         "login_required", "permission_required", "staff_member_required",
         "admin_required", "superuser_required", "authentication_required",
         "ownership_required", "role_required", "has_permission",
+    ]
+    # Docstring vocabulary that encodes *state-guard* intent, not auth intent.
+    # "must be APPROVED and not already refunded" is a precondition on the
+    # state machine — classifying it as auth poisons the differential engine.
+    _STATE_GUARD_PHRASES = [
+        "must be", "must not be", "already", "only when", "only if",
+        "requires state", "not already", "in progress", "pending only",
+        "approved only", "once", "twice",
+    ]
+    _AUTH_DOC_KEYWORDS = [
+        "admin", "administrator", "staff", "superuser", "owner only",
+        "authorized", "authenticated", "permission", "privileged",
+        "role", "login required", "must be logged", "restricted to",
+        "access control",
+    ]
+    _OWNERSHIP_DOC_KEYWORDS = [
+        "own", "their own", "belongs to", "the user's", "creator",
+        "owned by", "their order", "their account", "their profile",
     ]
 
     def __init__(self) -> None:
@@ -131,21 +176,40 @@ class IntentModel:
                         src_node.properties.get("args", []),
                     )
 
-        # Signal 2: Name encodes sensitive action + scope
+        # Signal 2: Name encodes a sensitive action.
+        #
+        # Two sub-cases:
+        #   a) scope is inferable from the name (admin_, manage_...) -> strong
+        #      auth expectation for that scope.
+        #   b) a sensitive action with no scope hint -> baseline auth
+        #      expectation ("authenticated"). delete_order(), refund_payment(),
+        #      etc. must never be callable anonymously.
         if self._has_sensitive_action(name):
+            action = self._extract_action(name)
             scope = self._infer_scope_from_name(name)
             if scope:
                 self._add_expectation(
                     entity_id=node.id, entity_name=node.name,
                     expectation_type="auth",
                     description=(
-                        f"Function '{node.name}' performs sensitive action '{self._extract_action(name)}' "
+                        f"Function '{node.name}' performs sensitive action '{action}' "
                         f"and name suggests '{scope}' scope authorization is expected"
                     ),
                     confidence=0.65, source=f"name_analysis:{node.name}", scope=scope,
                 )
+            elif action not in self._CREATION_ACTIONS:
+                self._add_expectation(
+                    entity_id=node.id, entity_name=node.name,
+                    expectation_type="auth",
+                    description=(
+                        f"Function '{node.name}' performs sensitive action '{action}'; "
+                        f"at minimum an authenticated caller is expected"
+                    ),
+                    confidence=0.55, source=f"name_analysis:{node.name}",
+                    scope="authenticated",
+                )
 
-        # Signal 3: Dual parameters suggest ownership check
+        # Signal 3: Ownership expectation from parameter shape.
         params = props.get("parameters", [])
         param_names = [p.get("name", "").lower() for p in params]
         has_owner = any("user_id" in pn or "owner" in pn for pn in param_names)
@@ -160,6 +224,19 @@ class IntentModel:
                 ),
                 confidence=0.7, source=f"parameter_analysis:{node.name}",
             )
+        elif self._takes_resource_identifier(node, param_names):
+            action = self._extract_action(name)
+            if action not in self._CREATION_ACTIONS:
+                self._add_expectation(
+                    entity_id=node.id, entity_name=node.name,
+                    expectation_type="ownership",
+                    description=(
+                        f"Function '{node.name}' acts on a resource identifier "
+                        f"({self._takes_resource_identifier(node, param_names)}), "
+                        f"suggesting a resource ownership check is expected"
+                    ),
+                    confidence=0.6, source=f"resource_param_analysis:{node.name}",
+                )
 
         # Signal 4: Docstring language
         docstring = props.get("docstring", "")
@@ -185,8 +262,8 @@ class IntentModel:
                     confidence=0.85, source=f"endpoint_analysis:{method} {route}",
                 )
 
-        # IDOR-prone routes
-        if "{id}" in route or "<id>" in route or "<int:" in route:
+        # IDOR-prone routes: /orders/<int:order_id>, /users/{id}, ...
+        if self._route_has_resource_id(route):
             self._add_expectation(
                 entity_id=node.id, entity_name=node.name,
                 expectation_type="ownership",
@@ -196,6 +273,25 @@ class IntentModel:
                 ),
                 confidence=0.75, source=f"route_analysis:{route}",
             )
+
+    @staticmethod
+    def _route_has_resource_id(route: str) -> bool:
+        """Whether a route template embeds a resource identifier segment."""
+        if not route:
+            return False
+        import re
+        for match in re.finditer(r"[<{]([^>}]+)[>}]", route):
+            segment = match.group(1).lower()
+            # Strip converter prefixes: <int:order_id> -> order_id
+            segment = segment.split(":")[-1]
+            if (
+                segment == "id"
+                or segment.endswith("_id")
+                or segment in {"pk", "uuid", "slug", "key"}
+                or segment in {"int", "str", "path", "float"}  # bare typed converters
+            ):
+                return True
+        return False
 
     def _analyze_class_node(self, node: GraphNode, graph: SemanticGraph) -> None:
         """Analyze a class node for intent signals."""
@@ -226,11 +322,66 @@ class IntentModel:
                     confidence=0.8, source=f"model_field_analysis:{node.name}",
                 )
 
+    # Strong caller-identity hints: when one of these params exists, the
+    # identity is already accounted for and generic `<x>_id` params are the
+    # resource under access (even `user_id`).
+    _STRONG_IDENTITY_HINTS = ("current", "request", "session", "actor", "caller", "auth_user")
+
+    def _takes_resource_identifier(self, node: GraphNode, param_names: List[str]) -> str:
+        """
+        Return the name of the parameter that identifies the *resource* being
+        accessed — e.g. ``order_id`` in ``delete_order(order_id, current_user)``
+        — or an empty string.
+
+        Caller-identity parameters (``current_user``, ``request``, ``session``)
+        are excluded. When a strong identity param is present, generic
+        ``user_id``-style params become resources again:
+        ``list_user_orders(user_id, current_user)`` — the IDOR target is
+        ``user_id``.
+        """
+        has_strong_identity = any(
+            any(h in pn for h in self._STRONG_IDENTITY_HINTS) for pn in param_names if pn
+        )
+        candidates: List[str] = []
+        for pn in param_names:
+            if not pn or pn in {"self", "cls"}:
+                continue
+            if any(h in pn for h in self._STRONG_IDENTITY_HINTS):
+                continue  # caller identity, not the resource
+            if not has_strong_identity and any(
+                h in pn for h in ("user", "owner", "auth")
+            ):
+                continue  # ambiguous identity param; no separate identity param
+            if any(pn == hint or pn.endswith("_" + hint) for hint in self._RESOURCE_ID_HINTS):
+                candidates.append(pn)
+
+        # Route templates count too: /orders/<int:order_id>
+        route = node.properties.get("route", "")
+        if route and ("<" in route or "{" in route):
+            candidates.append(f"route:{route}")
+
+        return candidates[0] if candidates else ""
+
     def _analyze_docstring(self, node: GraphNode, docstring: str) -> None:
         """Extract intent signals from docstrings."""
         doc_lower = docstring.lower()
-        for kw in ["only", "must be", "requires", "restricted", "authorized",
-                     "authenticated", "admin", "owner", "permission"]:
+
+        # State-guard intent takes priority over auth intent for phrases like
+        # "must be APPROVED" — a precondition on the workflow, not on identity.
+        for kw in self._STATE_GUARD_PHRASES:
+            if kw in doc_lower and not self._has_expectation_type(node.id, "state_guard"):
+                self._add_expectation(
+                    entity_id=node.id, entity_name=node.name,
+                    expectation_type="state_guard",
+                    description=(
+                        f"Docstring of '{node.name}' declares a state precondition "
+                        f"('{kw}'), suggesting a state guard is expected"
+                    ),
+                    confidence=0.6, source=f"docstring_analysis:{node.name}",
+                )
+                break
+
+        for kw in self._AUTH_DOC_KEYWORDS:
             if kw in doc_lower and not self._has_auth_expectation(node.id):
                 self._add_expectation(
                     entity_id=node.id, entity_name=node.name,
@@ -239,7 +390,8 @@ class IntentModel:
                     confidence=0.5, source=f"docstring_analysis:{node.name}",
                 )
                 break
-        for kw in ["own", "their", "belongs to", "the user's", "creator"]:
+
+        for kw in self._OWNERSHIP_DOC_KEYWORDS:
             if kw in doc_lower and not self._has_expectation_type(node.id, "ownership"):
                 self._add_expectation(
                     entity_id=node.id, entity_name=node.name,

@@ -52,12 +52,27 @@ _SEVERITY_WEIGHTS: Dict[Severity, float] = {
 # Each function takes a hypothesis and returns an experiment plan dict.
 
 
+def _resolve_target_url(hypothesis: Hypothesis) -> str:
+    """
+    Resolve the experiment target URL for a hypothesis.
+
+    Priority: explicit route metadata (extracted from routing decorators) →
+    attack surface only when it already looks like a path → an honest
+    static-analysis marker that no live URL could be derived.
+    """
+    route = hypothesis.metadata.get("route") if isinstance(hypothesis.metadata, dict) else None
+    if route:
+        return str(route)
+    for surface in hypothesis.attack_surface or []:
+        surface_str = str(surface)
+        if surface_str.startswith("/"):
+            return surface_str
+    return "/static-analysis-only/no-route-derived"
+
+
 def _build_idor_plan(hypothesis: Hypothesis) -> Dict[str, Any]:
     """Generate an IDOR experiment plan."""
-    target_url = hypothesis.attack_surface[0] if hypothesis.attack_surface else "/api/unknown"
-    # Normalize URL if it doesn't start with /
-    if not target_url.startswith("/"):
-        target_url = "/" + target_url
+    target_url = _resolve_target_url(hypothesis)
 
     return {
         "hypothesis_id": hypothesis.id,
@@ -94,9 +109,7 @@ def _build_idor_plan(hypothesis: Hypothesis) -> Dict[str, Any]:
 
 def _build_horizontal_escalation_plan(hypothesis: Hypothesis) -> Dict[str, Any]:
     """Generate a horizontal privilege escalation experiment plan."""
-    target_url = hypothesis.attack_surface[0] if hypothesis.attack_surface else "/api/unknown"
-    if not target_url.startswith("/"):
-        target_url = "/" + target_url
+    target_url = _resolve_target_url(hypothesis)
 
     return {
         "hypothesis_id": hypothesis.id,
@@ -131,9 +144,7 @@ def _build_horizontal_escalation_plan(hypothesis: Hypothesis) -> Dict[str, Any]:
 
 def _build_vertical_escalation_plan(hypothesis: Hypothesis) -> Dict[str, Any]:
     """Generate a vertical privilege escalation experiment plan."""
-    target_url = hypothesis.attack_surface[0] if hypothesis.attack_surface else "/api/unknown"
-    if not target_url.startswith("/"):
-        target_url = "/" + target_url
+    target_url = _resolve_target_url(hypothesis)
 
     return {
         "hypothesis_id": hypothesis.id,
@@ -169,9 +180,7 @@ def _build_vertical_escalation_plan(hypothesis: Hypothesis) -> Dict[str, Any]:
 
 def _build_workflow_bypass_plan(hypothesis: Hypothesis) -> Dict[str, Any]:
     """Generate a workflow bypass experiment plan."""
-    target_url = hypothesis.attack_surface[0] if hypothesis.attack_surface else "/api/unknown"
-    if not target_url.startswith("/"):
-        target_url = "/" + target_url
+    target_url = _resolve_target_url(hypothesis)
 
     return {
         "hypothesis_id": hypothesis.id,
@@ -208,9 +217,7 @@ def _build_workflow_bypass_plan(hypothesis: Hypothesis) -> Dict[str, Any]:
 
 def _build_race_condition_plan(hypothesis: Hypothesis) -> Dict[str, Any]:
     """Generate a race condition experiment plan."""
-    target_url = hypothesis.attack_surface[0] if hypothesis.attack_surface else "/api/unknown"
-    if not target_url.startswith("/"):
-        target_url = "/" + target_url
+    target_url = _resolve_target_url(hypothesis)
 
     return {
         "hypothesis_id": hypothesis.id,
@@ -250,9 +257,7 @@ def _build_race_condition_plan(hypothesis: Hypothesis) -> Dict[str, Any]:
 
 def _build_state_machine_violation_plan(hypothesis: Hypothesis) -> Dict[str, Any]:
     """Generate a state machine violation experiment plan."""
-    target_url = hypothesis.attack_surface[0] if hypothesis.attack_surface else "/api/unknown"
-    if not target_url.startswith("/"):
-        target_url = "/" + target_url
+    target_url = _resolve_target_url(hypothesis)
 
     return {
         "hypothesis_id": hypothesis.id,
@@ -681,9 +686,7 @@ class ExecutionPlanner:
             plan = builder(hypothesis)
         else:
             # Generic fallback plan for unknown vulnerability classes
-            target_url = hypothesis.attack_surface[0] if hypothesis.attack_surface else "/api/unknown"
-            if not target_url.startswith("/"):
-                target_url = "/" + target_url
+            target_url = _resolve_target_url(hypothesis)
 
             plan = {
                 "hypothesis_id": hypothesis.id,
@@ -710,9 +713,16 @@ class ExecutionPlanner:
                 "metadata": {},
             }
 
-        # Prepend base_url to target_url if set and target is relative
-        if self.base_url and plan["target_url"].startswith("/"):
-            plan["target_url"] = self.base_url + plan["target_url"]
+        # Prepend base_url to target_url if set and target is a real route.
+        # The static-analysis marker is not dispatchable — flag it instead.
+        if plan["target_url"] == "/static-analysis-only/no-route-derived":
+            plan["requires_live_target"] = False
+            plan["dispatchable"] = False
+        else:
+            plan["requires_live_target"] = True
+            plan["dispatchable"] = bool(self.base_url)
+            if self.base_url and plan["target_url"].startswith("/"):
+                plan["target_url"] = self.base_url + plan["target_url"]
 
         # Merge default headers (plan-specific headers take precedence)
         merged_headers = dict(self.default_headers)

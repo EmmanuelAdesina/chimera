@@ -116,6 +116,8 @@ class WorldState:
             "note": note,
         })
         self.current_phase = new_phase
+        if new_phase == AnalysisPhase.COMPLETE and self.completed_at is None:
+            self.completed_at = datetime.utcnow()
 
     # ------------------------------------------------------------------
     # File tracking
@@ -161,16 +163,25 @@ class WorldState:
         return [h for h in self.hypotheses if h.status == status]
 
     def record_debunked(self, hypothesis: Hypothesis) -> None:
-        """Record a debunked hypothesis."""
+        """Record a debunked hypothesis (idempotent)."""
+        if getattr(hypothesis, "_debunked_recorded", False):
+            return
+        hypothesis._debunked_recorded = True  # type: ignore[attr-defined]
         self.debunked_count += 1
 
     def record_confirmed(self, hypothesis: Hypothesis) -> None:
-        """Record a confirmed vulnerability."""
+        """Record a confirmed vulnerability (idempotent)."""
+        if getattr(hypothesis, "_confirmed_recorded", False):
+            return
+        hypothesis._confirmed_recorded = True  # type: ignore[attr-defined]
         self.confirmed_count += 1
         self.confirmed_vulnerabilities.append(hypothesis)
 
     def record_rejected(self, hypothesis: Hypothesis) -> None:
-        """Record a rejected hypothesis (experiment disproved it)."""
+        """Record a rejected hypothesis — experiment disproved it (idempotent)."""
+        if getattr(hypothesis, "_rejected_recorded", False):
+            return
+        hypothesis._rejected_recorded = True  # type: ignore[attr-defined]
         self.rejected_count += 1
 
     # ------------------------------------------------------------------
@@ -193,14 +204,23 @@ class WorldState:
         """Record a warning."""
         self.warnings.append(warning)
 
-    def summary(self) -> Dict[str, Any]:
-        """Produce a summary of the analysis state."""
-        return {
+    def summary(self, include_details: bool = True) -> Dict[str, Any]:
+        """Produce a summary of the analysis state.
+
+        Counts live under explicit ``*_count``-style keys; full detail lists
+        (``errors``, ``warnings``, ``hypotheses``) are included when
+        ``include_details`` is true. Both consumers — dashboards that want
+        numbers and callers that want the artifacts — are first-class.
+        """
+        base: Dict[str, Any] = {
             "phase": self.current_phase.value,
+            "target": self.config.target_path,
+            "target_version": self.config.target_version,
             "started_at": self.started_at.isoformat(),
             "completed_at": (
                 self.completed_at.isoformat() if self.completed_at else None
             ),
+            # Counts
             "files_parsed": len(self.parsed_files),
             "parse_errors": len(self.parse_errors),
             "total_hypotheses": len(self.hypotheses),
@@ -211,9 +231,21 @@ class WorldState:
             "differentials_found": self.total_differentials_found,
             "experiments_run": self.total_experiments_run,
             "memory_hits": self.memory_hits,
-            "errors": len(self.errors),
-            "warnings": len(self.warnings),
+            "error_count": len(self.errors),
+            "warning_count": len(self.warnings),
+            # Details
+            "errors": list(self.errors) if include_details else [],
+            "warnings": list(self.warnings) if include_details else [],
+            "parse_error_details": dict(self.parse_errors) if include_details else {},
+            "hypotheses": (
+                [h.to_dict() for h in self.hypotheses] if include_details else []
+            ),
+            "confirmed_vulnerabilities": (
+                [h.to_dict() for h in self.confirmed_vulnerabilities]
+                if include_details else []
+            ),
             "graph_stats": (
                 self.semantic_graph.stats() if self.semantic_graph else None
             ),
         }
+        return base

@@ -19,9 +19,10 @@ from __future__ import annotations
 
 import ast
 import logging
+import re
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 from chimera.core.semantic_graph import (
     EdgeType,
@@ -36,6 +37,7 @@ from chimera.models.evidence import (
     EvidenceSource,
     EvidenceType,
 )
+from chimera.parsers.errors import ParseError
 
 logger = logging.getLogger(__name__)
 
@@ -131,6 +133,94 @@ _STATE_VAR_NAMES: Set[str] = {
     "workflow_state",
 }
 
+# ---------------------------------------------------------------------------
+# Inline authorization-check vocabulary.
+#
+# These attribute / key names indicate an inline guard such as
+# ``if not current_user.is_admin: raise PermissionError`` or
+# ``current_user.get("role") != "admin"``.  The implementation model consumes
+# the emitted ``auth_checks`` property — keeping this vocabulary alive here is
+# what makes guarded code distinguishable from unguarded code.
+# ---------------------------------------------------------------------------
+_AUTH_ATTRIBUTE_NAMES: Set[str] = {
+    "is_admin",
+    "is_staff",
+    "is_superuser",
+    "is_authenticated",
+    "is_anonymous",
+    "is_owner",
+    "is_moderator",
+    "role",
+    "roles",
+    "permission",
+    "permissions",
+    "perms",
+    "scope",
+    "scopes",
+    "group",
+    "groups",
+    "allowed",
+    "authorize",
+    "authorized",
+    "can_access",
+}
+
+# Exceptions whose raise constitutes an explicit authorization guard.
+_AUTH_EXCEPTION_NAMES: Set[str] = {
+    "PermissionError",
+    "PermissionDenied",
+    "AuthenticationError",
+    "NotAuthenticated",
+    "AuthorizationError",
+    "AccessDenied",
+    "Forbidden",
+    "Unauthorized",
+}
+
+# Identity-side tokens for ownership comparisons (`current_user`, `request.user`, ...)
+_IDENTITY_TOKENS: Set[str] = {
+    "user",
+    "current_user",
+    "auth_user",
+    "request",
+    "session",
+    "identity",
+    "principal",
+    "actor",
+    "caller",
+    "me",
+}
+
+# Ownership-side tokens (`obj.owner`, `record.user_id`, `created_by`, ...)
+_OWNERSHIP_TOKENS: Set[str] = {
+    "owner",
+    "owner_id",
+    "user",
+    "user_id",
+    "created_by",
+    "creator",
+    "author",
+    "author_id",
+    "account",
+    "account_id",
+    "tenant",
+    "tenant_id",
+}
+
+# Create-style actions: these legitimately operate on not-yet-owned resources.
+_CREATION_ACTIONS: Set[str] = {
+    "create",
+    "register",
+    "signup",
+    "sign_up",
+    "init",
+    "initialize",
+    "new",
+    "add",
+    "make",
+    "build",
+}
+
 
 # ---------------------------------------------------------------------------
 # Helper data-classes
@@ -185,38 +275,93 @@ class PythonParser:
         recognise during class-type and auth detection.
     """
 
+    # ------------------------------------------------------------------
+    # Public API surface
+    # ------------------------------------------------------------------
+
+    #: Stable parser identifier (used by orchestrator / capability registry).
+    name: str = "python_ast"
+
+    #: File extensions this parser handles.
+    extensions: Tuple[str, ...] = (".py", ".pyi")
+
     def __init__(self, framework_hints: Optional[Dict[str, Set[str]]] = None) -> None:
         self._hints = framework_hints or {}
         self._evidence: List[Evidence] = []
+        self.graph: SemanticGraph = SemanticGraph()
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
-    def parse(self, file_path: str, source: str, graph: SemanticGraph) -> List[Evidence]:
+    def parse(
+        self,
+        file_path: str,
+        source: str,
+        graph: Optional[SemanticGraph] = None,
+    ) -> List[Evidence]:
         """
         Parse *source* (Python source text from *file_path*) and populate *graph*.
 
         Returns a list of :class:`Evidence` objects collected during parsing.
 
+        Parameters
+        ----------
+        file_path : str
+            Path of the source file (used for node provenance).
+        source : str
+            Python source text. ``None`` or whitespace-only input yields an
+            empty evidence list rather than raising.
+        graph : SemanticGraph, optional
+            Graph to populate. When ``None`` the parser populates its own
+            graph, available as ``self.graph`` afterwards.
+
         Raises
         ------
-        SyntaxError
-            If the source cannot be parsed by the ``ast`` module.
+        ParseError
+            If the source cannot be parsed by the ``ast`` module. Carries
+            file path, line number, and a snippet of the offending line.
         """
         self._evidence.clear()
-        tree = ast.parse(source, filename=file_path)
+        if graph is not None and not isinstance(graph, SemanticGraph):
+            raise TypeError(
+                f"graph must be a SemanticGraph instance (or None), got "
+                f"{type(graph).__name__}. Pass SemanticGraph() — a plain dict "
+                f"or networkx.Graph is not compatible with the parser cascade."
+            )
+        target_graph = graph if graph is not None else SemanticGraph()
+        self.graph = target_graph
+
+        if not source or not source.strip():
+            return []
+
+        # Strip a UTF-8 BOM defensively — feedparser-style files crash ast.parse.
+        if source.startswith("\ufeff"):
+            source = source.lstrip("\ufeff")
+
+        try:
+            tree = ast.parse(source, filename=file_path or "<unknown>")
+        except SyntaxError as exc:
+            raise ParseError.from_syntax_error(
+                exc, file_path or "<unknown>", source, parser=self.name
+            ) from exc
+        except (ValueError, TypeError, RecursionError, MemoryError) as exc:
+            raise ParseError(
+                f"unparseable Python source: {exc}",
+                file_path=file_path or "<unknown>",
+                parser=self.name,
+            ) from exc
 
         # Walk top-level statements
         for node in ast.iter_child_nodes(tree):
             if isinstance(node, ast.FunctionDef) or isinstance(node, ast.AsyncFunctionDef):
-                self._process_function(node, file_path, graph)
+                self._process_function(node, file_path, target_graph)
             elif isinstance(node, ast.ClassDef):
-                self._process_class(node, file_path, graph)
+                self._process_class(node, file_path, target_graph)
             elif isinstance(node, ast.Import):
-                self._process_import(node, file_path, graph)
+                self._process_import(node, file_path, target_graph)
             elif isinstance(node, ast.ImportFrom):
-                self._process_import_from(node, file_path, graph)
+                self._process_import_from(node, file_path, target_graph)
 
         return list(self._evidence)
 
@@ -322,6 +467,26 @@ class PythonParser:
             for comp in comparisons:
                 if self._looks_like_ownership_check(comp):
                     func_node.semantic_tags.add("ownership_check")
+
+        # Inline authorization checks (is_admin gates, PermissionError raises…)
+        auth_checks = self._extract_auth_checks(node)
+        if auth_checks:
+            func_node.properties["auth_checks"] = auth_checks
+            func_node.semantic_tags.add("auth_checked")
+
+        # SQL grammar differentials — string-built queries vs parameterization
+        sql_taint, sql_parameterized = self._extract_sql_taint(node)
+        if sql_taint:
+            func_node.properties["sql_taint"] = sql_taint
+            func_node.semantic_tags.add("sql_construction")
+        if sql_parameterized:
+            func_node.properties["sql_parameterized"] = True
+            func_node.semantic_tags.add("sql_parameterized")
+
+        # Structural body records — what the implementation model traverses.
+        func_node.properties["body_nodes"] = self._build_body_records(
+            node, comparisons, auth_checks
+        )
 
         # Collect evidence
         self._evidence.append(Evidence.from_ast_node(
@@ -482,6 +647,7 @@ class PythonParser:
         params = self._parse_args(node.args)
         docstring = ast.get_docstring(node)
 
+        decorator_names = [self._decorator_name(d) for d in node.decorator_list]
         properties: Dict[str, Any] = {
             "is_async": isinstance(node, ast.AsyncFunctionDef),
             "parameters": [
@@ -495,19 +661,26 @@ class PythonParser:
                 for p in params
             ],
             "has_docstring": docstring is not None,
-            "decorator_names": [self._decorator_name(d) for d in node.decorator_list],
+            "decorator_names": decorator_names,
+            # Alias consumed by ImplementationModel / IntentModel.
+            "decorators": decorator_names,
             "body_start": node.body[0].lineno if node.body else node.lineno,
         }
         if docstring:
             properties["docstring"] = docstring
 
-        # Detect endpoint patterns
+        # Detect endpoint patterns + extract route metadata
         semantic_tags: Set[str] = set()
         for dec in node.decorator_list:
             dec_name = self._decorator_name(dec)
             if self._is_route_decorator(dec_name):
                 semantic_tags.add("route")
                 semantic_tags.add("endpoint")
+                route_info = self._extract_route_info(dec, dec_name)
+                if route_info.get("route"):
+                    properties.setdefault("route", route_info["route"])
+                if route_info.get("method"):
+                    properties.setdefault("method", route_info["method"])
 
         node_type = NodeType.ENDPOINT if "endpoint" in semantic_tags else NodeType.FUNCTION
 
@@ -533,6 +706,7 @@ class PythonParser:
             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
         ]
         docstring = ast.get_docstring(node)
+        fields = self._extract_class_fields(node)
 
         node_type_map = {
             "model": NodeType.MODEL,
@@ -554,11 +728,69 @@ class PythonParser:
                 "bases": bases,
                 "class_type": class_type,
                 "methods": methods,
+                "fields": fields,
                 "has_docstring": docstring is not None,
                 "decorator_names": [self._decorator_name(d) for d in node.decorator_list],
             },
             semantic_tags=semantic_tags,
         )
+
+    def _extract_class_fields(self, node: ast.ClassDef) -> List[Dict[str, Any]]:
+        """
+        Extract simple class-level field declarations (ORM-style).
+
+        Handles::
+
+            status = models.CharField(choices=[("pending", ...), ...])
+            owner = models.ForeignKey("User")
+            balance: float = 0.0
+        """
+        fields: List[Dict[str, Any]] = []
+
+        for stmt in node.body:
+            field_name = ""
+            annotation = ""
+            value_node: Optional[ast.expr] = None
+
+            if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and isinstance(
+                stmt.targets[0], ast.Name
+            ):
+                field_name = stmt.targets[0].id
+                value_node = stmt.value
+            elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+                field_name = stmt.target.id
+                annotation = self._resolve_name(stmt.annotation)
+                value_node = stmt.value
+            else:
+                continue
+
+            ftype = annotation or (
+                self._resolve_name(value_node.func)
+                if isinstance(value_node, ast.Call)
+                else type(value_node).__name__ if value_node is not None else ""
+            )
+
+            field: Dict[str, Any] = {"name": field_name, "type": ftype}
+
+            # choices=[("pending", "Pending"), ...] — ORM enum fields
+            if isinstance(value_node, ast.Call):
+                for kw in value_node.keywords:
+                    if kw.arg == "choices" and isinstance(kw.value, (ast.List, ast.Tuple)):
+                        choices: List[Any] = []
+                        for elt in kw.value.elts:
+                            if isinstance(elt, (ast.List, ast.Tuple)) and elt.elts:
+                                first = elt.elts[0]
+                                choices.append(
+                                    first.value if isinstance(first, ast.Constant) else str(first)
+                                )
+                            elif isinstance(elt, ast.Constant):
+                                choices.append(elt.value)
+                        if choices:
+                            field["choices"] = choices
+
+            fields.append(field)
+
+        return fields
 
     def _visit_decorator(
         self, node: ast.expr, file_path: str
@@ -697,17 +929,14 @@ class PythonParser:
             if isinstance(node, ast.Assign):
                 for target in node.targets:
                     target_name = self._resolve_name(target)
-                    if self._is_state_variable(target_name):
+                    state_key = self._state_key_for_target(target, target_name)
+                    if state_key:
                         ops.append({
-                            "variable": target_name,
+                            "variable": state_key,
                             "new_value": self._resolve_name(node.value),
                             "line": node.lineno,
                             "kind": "assignment",
                         })
-            elif isinstance(node, ast.Attribute):
-                # Also catch method calls like order.approve() — these are
-                # handled via _extract_calls, but we tag them as state ops here.
-                pass
 
         # Augmented assignments (e.g. obj.status += 1) — covered by walk above,
         # but explicitly check AugAssign nodes
@@ -724,6 +953,156 @@ class PythonParser:
                     })
 
         return ops
+
+    # ------------------------------------------------------------------
+    # SQL grammar-differential extraction (injection taint)
+    # ------------------------------------------------------------------
+
+    _SQL_KEYWORDS = re.compile(
+        r"\b(SELECT|INSERT|UPDATE|DELETE|WHERE|FROM|VALUES|SET|UNION|DROP)\b",
+        re.IGNORECASE,
+    )
+
+    def _extract_sql_taint(
+        self, func_node: Union[ast.FunctionDef, ast.AsyncFunctionDef]
+    ) -> Tuple[List[Dict[str, Any]], bool]:
+        """
+        Detect string-constructed SQL (injection surface) and parameterization.
+
+        A taint finding requires BOTH:
+          1. a SQL-looking literal (SELECT/INSERT/...), and
+          2. an interpolated non-constant value (f-string, concat, %, .format).
+
+        A function is parameterized when it calls ``execute(...)`` /
+        ``executemany(...)`` with a second argument (the parameter tuple) —
+        the sanitizer in the grammar cascade.
+        """
+        taints: List[Dict[str, Any]] = []
+        parameterized = False
+
+        def _names_in(node: ast.expr) -> List[str]:
+            names = []
+            for sub in ast.walk(node):
+                if isinstance(sub, ast.Name):
+                    names.append(sub.id)
+                elif isinstance(sub, ast.Attribute):
+                    names.append(self._resolve_name(sub))
+                elif isinstance(sub, ast.Subscript):
+                    names.append(self._resolve_name(sub))
+            return [n for n in names if n and not n.startswith(("'", '"'))]
+
+        for node in ast.walk(func_node):
+            # f"...{value}..." with SQL keywords
+            if isinstance(node, ast.JoinedStr):
+                literal = "".join(
+                    v.value for v in node.values if isinstance(v, ast.Constant)
+                )
+                if self._SQL_KEYWORDS.search(literal):
+                    interpolated = [
+                        name
+                        for v in node.values
+                        if isinstance(v, ast.FormattedValue)
+                        for name in _names_in(v.value)
+                    ]
+                    if interpolated:
+                        taints.append({
+                            "kind": "fstring",
+                            "detail": f"f-string SQL with interpolation of {interpolated[:4]}",
+                            "interpolated": interpolated,
+                            "line": node.lineno,
+                        })
+
+            # "..." % params  (printf-style)
+            elif isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mod):
+                if isinstance(node.left, ast.Constant) and isinstance(node.left.value, str):
+                    if self._SQL_KEYWORDS.search(node.left.value):
+                        interpolated = _names_in(node.right)
+                        taints.append({
+                            "kind": "printf",
+                            "detail": "printf-style SQL formatting",
+                            "interpolated": interpolated,
+                            "line": node.lineno,
+                        })
+
+            # "SELECT ... " + variable  (concatenation)
+            elif isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+                left_is_sqlstr = (
+                    isinstance(node.left, ast.Constant)
+                    and isinstance(node.left.value, str)
+                    and bool(self._SQL_KEYWORDS.search(node.left.value))
+                )
+                right_is_sqlstr = (
+                    isinstance(node.right, ast.Constant)
+                    and isinstance(node.right.value, str)
+                    and bool(self._SQL_KEYWORDS.search(node.right.value))
+                )
+                if left_is_sqlstr:
+                    interpolated = _names_in(node.right)
+                    if interpolated:
+                        taints.append({
+                            "kind": "concat",
+                            "detail": "SQL string concatenation",
+                            "interpolated": interpolated,
+                            "line": node.lineno,
+                        })
+                elif right_is_sqlstr:
+                    interpolated = _names_in(node.left)
+                    if interpolated:
+                        taints.append({
+                            "kind": "concat",
+                            "detail": "SQL string concatenation",
+                            "interpolated": interpolated,
+                            "line": node.lineno,
+                        })
+
+            # "...{}...".format(value)
+            elif isinstance(node, ast.Call):
+                func = node.func
+                attr = func.attr.lower() if isinstance(func, ast.Attribute) else ""
+                if isinstance(func, ast.Attribute) and attr == "format":
+                    base = func.value
+                    if isinstance(base, ast.Constant) and isinstance(base.value, str):
+                        if self._SQL_KEYWORDS.search(base.value):
+                            interpolated = [n for a in node.args for n in _names_in(a)]
+                            if interpolated:
+                                taints.append({
+                                    "kind": "format",
+                                    "detail": "str.format SQL construction",
+                                    "interpolated": interpolated,
+                                    "line": node.lineno,
+                                })
+                # Parameterization sanitizer: conn.execute(sql, (params,))
+                if isinstance(func, ast.Attribute) and attr in {
+                    "execute", "executemany",
+                }:
+                    if len(node.args) >= 2 or node.keywords:
+                        parameterized = True
+
+        return taints, parameterized
+
+    @staticmethod
+    def _state_key_for_target(target: ast.expr, resolved_name: str) -> str:
+        """
+        Return the normalized state-variable key for an assignment target,
+        or "" if the target is not a state variable.
+
+        Handles the three idioms::
+
+            status = "APPROVED"            -> "status"
+            order.status = "APPROVED"      -> "order.status"
+            refund["status"] = "APPROVED"  -> "refund.status"
+        """
+        if PythonParser._is_state_variable(resolved_name):
+            return resolved_name
+        if isinstance(target, ast.Subscript):
+            slice_node = target.slice
+            key = ""
+            if isinstance(slice_node, ast.Constant) and isinstance(slice_node.value, str):
+                key = slice_node.value
+            if key in _STATE_VAR_NAMES:
+                base = PythonParser._resolve_name(target.value)
+                return f"{base}.{key}" if base else key
+        return ""
 
     def _extract_comparisons(
         self, func_node: Union[ast.FunctionDef, ast.AsyncFunctionDef]
@@ -744,6 +1123,186 @@ class PythonParser:
                 ))
 
         return comparisons
+
+    # ------------------------------------------------------------------
+    # Inline authorization-check extraction
+    # ------------------------------------------------------------------
+
+    def _extract_auth_checks(
+        self, func_node: Union[ast.FunctionDef, ast.AsyncFunctionDef]
+    ) -> List[Dict[str, Any]]:
+        """
+        Detect inline authorization guards within a function body.
+
+        Recognized idioms:
+
+        1. Attribute/key guards — ``if not user.is_admin: ...``,
+           ``user.get("role") == "admin"``, ``if not is_staff:``
+        2. Guard-by-exception — ``raise PermissionError(...)``,
+           ``raise HTTPException(status_code=403)``, ``abort(403)``
+        3. Auth predicate calls — ``has_permission(...)``, ``check_role(...)``
+
+        Returns a list of records: ``{"kind", "detail", "line"}``.
+        """
+        checks: List[Dict[str, Any]] = []
+
+        for node in ast.walk(func_node):
+            # If gates whose test mentions an auth attribute / predicate call
+            if isinstance(node, ast.If):
+                guard = self._classify_guard_expression(node.test)
+                if guard:
+                    checks.append({
+                        "kind": guard,
+                        "detail": self._resolve_name(node.test) if isinstance(node.test, ast.Name) else ast.dump(node.test)[:160],
+                        "line": node.lineno,
+                    })
+                    continue  # don't double-count nested compares below
+
+            # Explicit auth exceptions
+            if isinstance(node, ast.Raise):
+                exc_name = self._resolve_name(node.exc) if node.exc else ""
+                exc_leaf = exc_name.split(".")[-1].rstrip("()")
+                if exc_leaf in _AUTH_EXCEPTION_NAMES:
+                    checks.append({
+                        "kind": "auth_raise",
+                        "detail": f"raise {exc_name}",
+                        "line": node.lineno,
+                    })
+
+            # abort(403) / abort(401) — Flask guard idiom
+            if isinstance(node, ast.Call):
+                call_name = self._resolve_name(node.func)
+                if call_name.split(".")[-1] == "abort":
+                    for arg in node.args:
+                        if isinstance(arg, ast.Constant) and arg.value in (401, 403):
+                            checks.append({
+                                "kind": "auth_abort",
+                                "detail": f"abort({arg.value})",
+                                "line": node.lineno,
+                            })
+
+            # Return of HTTP 401/403 — guard-by-response
+            if isinstance(node, ast.Return) and node.value is not None:
+                ret_text = self._resolve_name(node.value)
+                if isinstance(node.value, ast.Constant) and node.value.value in (401, 403):
+                    checks.append({
+                        "kind": "auth_response",
+                        "detail": f"return {ret_text}",
+                        "line": node.lineno,
+                    })
+
+        return checks
+
+    def _classify_guard_expression(self, test: ast.expr) -> str:
+        """
+        Classify an ``if`` test: ``"auth_attribute"``, ``"auth_call"``,
+        ``"auth_compare"`` or ``""`` (no auth signal).
+
+        Pure AST analysis — identifiers resolved via symbol table, substrings
+        only applied to the leaf name of an attribute chain.
+        """
+        names: Set[str] = set()
+        calls: Set[str] = set()
+        has_compare = False
+
+        for sub in ast.walk(test):
+            if isinstance(sub, ast.Name):
+                names.add(sub.id.lower())
+            elif isinstance(sub, ast.Attribute):
+                names.add(sub.attr.lower())
+            elif isinstance(sub, ast.Call):
+                leaf = self._resolve_name(sub.func).split(".")[-1].lower()
+                calls.add(leaf)
+                # .get("is_admin") — dict-style attribute access
+                for arg in sub.args:
+                    if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                        names.add(arg.value.lower())
+                for kw in sub.keywords:
+                    if isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, str):
+                        names.add(kw.value.value.lower())
+            elif isinstance(sub, ast.Constant) and isinstance(sub.value, str):
+                names.add(sub.value.lower())
+            elif isinstance(sub, ast.Compare):
+                has_compare = True
+
+        if names & _AUTH_ATTRIBUTE_NAMES:
+            return "auth_compare" if has_compare else "auth_attribute"
+
+        auth_predicates = {
+            "has_perm", "has_permission", "check_permission", "check_perms",
+            "check_role", "require_role", "is_authorized", "authorize",
+            "verify_permission", "ensure_admin", "check_auth", "require_permission",
+            "user_passes_test",
+        }
+        if calls & auth_predicates:
+            return "auth_call"
+
+        return ""
+
+    def _build_body_records(
+        self,
+        func_node: Union[ast.FunctionDef, ast.AsyncFunctionDef],
+        comparisons: List[_CompareInfo],
+        auth_checks: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """
+        Build the structural ``body_nodes`` records consumed by the
+        ImplementationModel.  Each record is a small dict describing one
+        security-relevant body element (comparisons, auth gates, raises).
+        """
+        records: List[Dict[str, Any]] = []
+        for comp in comparisons:
+            records.append({
+                "node_type": "Compare",
+                "left": comp.left,
+                "ops": comp.ops,
+                "comparators": comp.comparators,
+                "line": comp.line,
+            })
+        for check in auth_checks:
+            records.append({
+                "node_type": "AuthCheck",
+                "kind": check["kind"],
+                "detail": check["detail"],
+                "line": check["line"],
+            })
+        return records
+
+    def _extract_route_info(self, dec: ast.expr, dec_name: str) -> Dict[str, str]:
+        """
+        Extract ``route`` path and HTTP ``method`` from a routing decorator.
+
+        Handles::
+
+            @app.route("/orders/<int:order_id>", methods=["DELETE"])
+            @router.get("/users/{user_id}")
+            @app.delete("/items/{item_id}")
+        """
+        info: Dict[str, str] = {}
+        leaf = dec_name.split(".")[-1].rstrip("()").lower()
+
+        # Verb-style decorators encode the method in their name.
+        verb_methods = {"get", "post", "put", "patch", "delete", "head", "options"}
+        if leaf in verb_methods:
+            info["method"] = leaf.upper()
+
+        if isinstance(dec, ast.Call):
+            # First string positional arg is the route path.
+            for arg in dec.args:
+                if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                    if arg.value.startswith("/"):
+                        info.setdefault("route", arg.value)
+                        break
+            for kw in dec.keywords:
+                if kw.arg in ("rule", "path", "url"):
+                    if isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, str):
+                        info.setdefault("route", kw.value.value)
+                if kw.arg == "methods" and isinstance(kw.value, (ast.List, ast.Tuple)):
+                    for elt in kw.value.elts:
+                        if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                            info.setdefault("method", elt.value.upper())
+                            break
+        return info
 
     # ------------------------------------------------------------------
     # Class-type detection
@@ -1027,18 +1586,37 @@ class PythonParser:
     @staticmethod
     def _looks_like_ownership_check(comp: _CompareInfo) -> bool:
         """
-        Heuristic: an ownership check compares an ``.owner`` or ``.user``
-        attribute against ``request.user`` (or similar).
+        Heuristic: an ownership check compares an ``.owner`` / ``.user_id``
+        attribute against the requestor identity (``request.user``,
+        ``current_user['id']``, ``session.user``...).
+
+        Both ``==`` (assert-style) and ``!=`` (guard-by-exception) count —
+        what matters is that the resource owner is compared to the caller:
+
+            order["owner"] != current_user["id"]  -> raise  (guard)
+            order.owner == request.user                        (assertion)
         """
-        left_lower = comp.left.lower()
-        for comparator in comp.comparators:
-            comp_lower = comparator.lower()
-            # obj.user == request.user  /  obj.owner == self.request.user
-            has_owner_attr = (".user" in left_lower or ".owner" in left_lower
-                              or ".user" in comp_lower or ".owner" in comp_lower)
-            has_request = "request" in left_lower or "request" in comp_lower
-            if has_owner_attr and has_request and "==" in comp.ops:
-                return True
+        if not ({"==", "!="} & set(comp.ops)):
+            return False
+
+        sides = [comp.left.lower(), *(c.lower() for c in comp.comparators)]
+
+        def _side_tokens(side: str) -> Set[str]:
+            # Split on attribute/subscript boundaries and match whole tokens
+            # so `username` does not masquerade as `user`.
+            tokens = set(re.split(r"[\.\[\]\(\)'\s\"]+", side))
+            tokens.discard("")
+            return tokens
+
+        side_tokens = [_side_tokens(s) for s in sides]
+        for i in range(len(sides)):
+            for j in range(len(sides)):
+                if i == j:
+                    continue
+                if (side_tokens[i] & _OWNERSHIP_TOKENS) and (
+                    side_tokens[j] & _IDENTITY_TOKENS
+                ):
+                    return True
         return False
 
     # ------------------------------------------------------------------

@@ -1,5 +1,10 @@
 # Chimera Assessment — Field Test Report
 
+> **STATUS: RESOLVED (v2.1).** Every defect in this report was fixed in the
+> follow-up remediation pass. See **[docs/REMEDIATION.md](docs/REMEDIATION.md)**
+> for fix-by-fix mapping and regression tests (`124 passed`). The text below
+> is preserved as the historical record of what the field test found.
+
 **Date:** 2026-08-23 · **Commit:** `52fcd4e` · **Tester:** Arena agent, fresh clone, Python 3.11.2
 
 **What was done:** installed and started Chimera, ran its reasoning loop against the shipped

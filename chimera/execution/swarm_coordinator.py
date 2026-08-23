@@ -140,15 +140,32 @@ class SwarmCoordinator:
 
     async def dispatch_swarm(self, tasks: Sequence[SwarmTask]) -> List[SwarmResult]:
         """
-        Convenience method for finite batches.
+        Dispatch a finite batch and return results in SUBMISSION order.
+
+        Workers complete tasks out of order; results are re-keyed by task id
+        so ``results[i]`` always corresponds to ``tasks[i]``. Callers mapping
+        results back to inputs must never see silent misattribution.
         """
         await self.start()
         await self.submit_many(tasks)
 
-        results: List[SwarmResult] = []
+        by_id: Dict[str, SwarmResult] = {}
         for _ in range(len(tasks)):
-            results.append(await self._results.get())
+            result = await self._results.get()
+            by_id[result.task_id] = result
 
+        results: List[SwarmResult] = []
+        for task in tasks:
+            result = by_id.get(task.id)
+            if result is None:
+                result = SwarmResult(
+                    task_id=task.id,
+                    capability=task.capability,
+                    status=TaskStatus.FAILED,
+                    error="result lost in dispatch",
+                    finished_at=datetime.utcnow().isoformat(),
+                )
+            results.append(result)
         return results
 
     async def harvest_evidence(self, result_count: int) -> List[Evidence]:
