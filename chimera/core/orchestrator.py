@@ -87,6 +87,7 @@ class ChimeraOrchestrator:
         self._graphql_schemas: Dict[str, str] = {}
         self._python_sources: Dict[str, str] = {}
         self._js_findings: List[Any] = []
+        self._experiment_plans: List[Dict[str, Any]] = []
 
     # ------------------------------------------------------------------
     # Public API
@@ -120,6 +121,23 @@ class ChimeraOrchestrator:
             for h in self.state.get_active_hypotheses()
             if 0.0 < h.confidence < threshold
         ]
+        # Dynamic-confirmation backlog: dispatchable, live-target plans the
+        # orchestrator generated but did not execute (static runs close the
+        # loop with probes only). Surfacing them makes the certainty ceiling
+        # explicit and hands a ready-made dispatch list to the swarm plane.
+        pending = [
+            {
+                "hypothesis_id": p.get("hypothesis_id"),
+                "method": p.get("method"),
+                "target_url": p.get("target_url"),
+                "expected_outcome": p.get("expected_outcome"),
+                "falsifying_outcome": p.get("falsifying_outcome"),
+            }
+            for p in self._experiment_plans
+            if p.get("dispatchable") and p.get("requires_live_target")
+        ]
+        summary["pending_dynamic_confirmation"] = pending[:20]
+        summary["pending_dynamic_confirmation_count"] = len(pending)
         return summary
 
     def run(self, target_path: Optional[str] = None) -> Dict[str, Any]:

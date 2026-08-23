@@ -29,6 +29,59 @@ class TestSummaryContract:
         assert result["phase"] == "complete"
         assert result["completed_at"] is not None
 
+    def test_pending_dynamic_confirmation_static_marker(self, vuln_orders_path):
+        """Decorator-less service code yields honest static-only plans:
+        nothing is falsely reported as dispatchable."""
+        result = ChimeraOrchestrator(AnalysisConfig(target_path=vuln_orders_path)).analyze()
+        assert isinstance(result["pending_dynamic_confirmation"], list)
+        assert isinstance(result["pending_dynamic_confirmation_count"], int)
+        assert result["pending_dynamic_confirmation_count"] >= len(
+            result["pending_dynamic_confirmation"]
+        )
+        # vuln_orders has no route decorators → honest static marker, and
+        # the summary must NOT claim dispatchable live-target plans exist.
+        assert result["confirmed_vulnerabilities"]  # analysis still works
+        assert result["pending_dynamic_confirmation"] == []
+
+    def test_pending_dynamic_confirmation_real_routes(self, tmp_path):
+        """Decorated handlers produce dispatchable plans with real route URLs,
+        and those plans are surfaced in the summary."""
+        app = tmp_path / "route_app.py"
+        app.write_text(
+            "from flask import Flask, jsonify\n"
+            "app = Flask(__name__)\n"
+            "ORDERS = {1: {'id': 1, 'owner': 'alice'}}\n\n"
+            "@app.route('/orders/<int:order_id>', methods=['GET'])\n"
+            "def get_order(order_id):\n"
+            "    return jsonify(ORDERS.get(order_id))\n",
+            encoding="utf-8",
+        )
+        result = ChimeraOrchestrator(
+            AnalysisConfig(target_path=str(tmp_path), base_url="http://example.test")
+        ).analyze()
+        pending = result["pending_dynamic_confirmation"]
+        assert pending, result["hypotheses"]
+        assert result["pending_dynamic_confirmation_count"] == len(pending)
+        for entry in pending:
+            assert set(entry) == {
+                "hypothesis_id",
+                "method",
+                "target_url",
+                "expected_outcome",
+                "falsifying_outcome",
+            }
+            assert entry["hypothesis_id"]
+            assert entry["method"] == "GET"
+            assert entry["target_url"] == "http://example.test/orders/<int:order_id>"
+
+    def test_pending_dynamic_confirmation_present_on_empty_runs(self, tmp_path):
+        """Key exists even when the experimentation phase returns early."""
+        result = ChimeraOrchestrator(
+            AnalysisConfig(target_path=str(tmp_path))
+        ).analyze()
+        assert result["pending_dynamic_confirmation"] == []
+        assert result["pending_dynamic_confirmation_count"] == 0
+
     def test_run_alias(self, vuln_app_path):
         orch = ChimeraOrchestrator()
         result = orch.run(vuln_app_path)  # legacy entrypoint compatibility

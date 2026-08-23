@@ -7,7 +7,7 @@ This document maps every reported defect to its fix and its regression test.
 Verification evidence is reproducible with:
 
 ```bash
-python -m pip install -e . && python -m pytest tests/ -q      # 124 passed
+python -m pip install -e . && python -m pytest tests/ -q      # 144 passed
 python -m chimera analyze tests/targets/vuln_orders_app.py    # 9 confirmed
 python -m chimera analyze tests/targets/safe_orders_app.py    # 0 confirmed
 ```
@@ -20,11 +20,11 @@ python -m chimera analyze tests/targets/safe_orders_app.py    # 0 confirmed
 **Was:** 3/6 test files failed at *collection* (`CausalEngine`, `ParserLayer`,
 `EpistemicMonitor`, `ChimeraMemory`, `GrammarModel` — none existed); 2 more
 failed at runtime (`orch.run()`, `PythonParser().name`). Only `test_import.py` passed.
-**Now:** the suite was regenerated against the real v2 API — 124 tests across
+**Now:** the suite was regenerated against the real v2 API — 144 tests across
 9 files: orchestrator, causal engine, epistemic engine, memory, debunker,
 static verifier, python/sql parsers, swarm coordinator, terminal layer, and
 integration (end-to-end + parser cascade). Stale v1 tests were deleted.
-**Regression:** `python -m pytest tests/` → `124 passed`.
+**Regression:** `python -m pytest tests/` → `144 passed`.
 
 ### A2. Orchestrator result structure mismatch
 **Was:** `errors` was an int count, no `hypotheses` key, `completed_at` never set.
@@ -188,8 +188,29 @@ injection @0.76**, `get_user_safe` untouched.
   (`-c/-e/-m/--eval`…) for allowlisted interpreters — the
   `python -c "open('/tmp/pwned.txt',...)"` escape from the assessment is
   blocked (opt-in via `allow_interpreter_code=True` for hardened sandboxes).
-- **Caido session leak**: unchanged in this pass (plugin layer, no regression
-  coverage in scope).
+- **Caido bridge lifecycle** (follow-up pass): the bridge had defects far
+  worse than the reported session leak, and all are now fixed in
+  `chimera/plugins/caido_bridge.py` with 17 hermetic regression tests
+  (aiohttp is an optional extra, so tests inject a fake module):
+  1. **Infinite mutual recursion**: the old `initialize()` health-check called
+     `graphql()`, and `graphql()` always called `initialize()` first. The
+     first real call recursed until `RecursionError` (silently swallowed by
+     `except Exception: pass`), then every unwinding frame fired its own
+     health-check POST. **Measured: 495 HTTP POSTs for one user call** (494
+     spurious) → now exactly 2 (1 health-check + 1 real query). The
+     health-check now runs through a recursion-free `_post_json` transport
+     guarded by an `_initialized` flag.
+  2. **Stale-session bricking**: a closed `aiohttp.ClientSession` was never
+     recreated (`session.closed` was never inspected), permanently breaking
+     the bridge. Now `_ensure_session()` recreates absent-or-closed sessions.
+  3. **Unattended session leak**: no deterministic cleanup path existed.
+     `CaidoBridge` is now an async context manager
+     (`async with CaidoBridge(cfg) as bridge: ...`) guaranteeing
+     `cleanup()`/session close; `cleanup()` also resets initialization state
+     so the bridge is reusable afterwards.
+  - Registration contract unchanged (`initialize/execute/cleanup`, config
+    dict constructor) so `swarm_bootstrap.py`'s `caido.execute` capability is
+    unaffected.
 
 ## D. Packaging & honesty
 
@@ -202,7 +223,7 @@ injection @0.76**, `get_user_safe` untouched.
   `--json` + `--quiet` + `--dynamic` flags; exit 0 on successful analysis, 2 on
   usage/IO errors, and optional `--fail-on-findings` → exit 1 when confirmed
   vulnerabilities exist (CI gating, defaults unchanged).
-- README badges/claims updated to the true state (124 tests, zero core deps,
+- README badges/claims updated to the true state (144 tests, zero core deps,
   v2.1, injection class, quickstart actually works).
 - State counters are idempotent (`record_debunked/confirmed/rejected` can't
   double-count on re-entry).
@@ -222,7 +243,7 @@ injection @0.76**, `get_user_safe` untouched.
 | Calibration ceiling | ~0.15 → nothing confirmable | honest findings reach 0.6–0.76; weak ones stay below |
 | Loop closure | plans counted, never run | static falsification probes execute; verdicts attached; weak claims rejected |
 | `python -m chimera analyze` | `__main__.py` missing | works; human + JSON reports |
-| Test suite | 1/6 files passing (collection errors) | **124/124 passing** |
+| Test suite | 1/6 files passing (collection errors) | **144/144 passing** |
 | Sandbox `python -c` escape | executed | blocked by default policy |
 | Swarm result ordering | completion order (silent misattribution) | submission order, regression-tested |
 | Hard dependencies | 7 fictional | 0 (stdlib core; extras are real) |
@@ -234,6 +255,12 @@ injection @0.76**, `get_user_safe` untouched.
   requires running the swarm plane yourself (`swarm_bootstrap`), at which
   point plans carry real routes, expected/falsifying outcomes, and
   chain-of-custody evidence. This is honest: static certainty has a ceiling.
+  The ceiling is now *visible*: `analyze()` summaries expose
+  `pending_dynamic_confirmation` / `pending_dynamic_confirmation_count` —
+  dispatchable, live-target plans the orchestrator deliberately did not fire
+  (real route URLs joined to `base_url` when decorators exist; decorator-less
+  service code honestly yields the non-dispatchable static marker rather
+  than fabricated URLs).
 - The Debunker targets a high FP kill rate on *generated* hypotheses; with
   guard detection fixed, most FPs die earlier (at observation time), which is
   the correct outcome — the kill-rate metric alone no longer tells the story.

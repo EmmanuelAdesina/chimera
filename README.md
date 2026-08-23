@@ -6,7 +6,7 @@
 *It does not match signatures. It falsifies assumptions.*
 
 ![Python](https://img.shields.io/badge/python-3.11%2B-blue?style=for-the-badge)
-![Tests](https://img.shields.io/badge/tests-124%20passing-brightgreen?style=for-the-badge)
+![Tests](https://img.shields.io/badge/tests-144%20passing-brightgreen?style=for-the-badge)
 ![Dependencies](https://img.shields.io/badge/core%20dependencies-zero-orange?style=for-the-badge)
 ![Status](https://img.shields.io/badge/status-v2.1%20closed--loop-red?style=for-the-badge)
 
@@ -104,7 +104,7 @@ Chimera treats external tools as **epistemic sensors**, not products:
 git clone https://github.com/emmanuelAdesina/chimera
 cd chimera
 python -m pip install -e .          # core runs on the standard library alone
-python -m pytest tests/             # 124 tests
+python -m pytest tests/             # 144 tests
 ```
 
 Run your first analysis (no installs, no services needed):
