@@ -38,6 +38,7 @@ class VulnerabilityClass(Enum):
     WORKFLOW_BYPASS = "workflow_bypass"
     RACE_CONDITION = "race_condition"
     STATE_MACHINE_VIOLATION = "state_machine_violation"
+    INJECTION = "injection"  # SQL/command/template — grammar differentials
 
 
 class HypothesisStatus(Enum):

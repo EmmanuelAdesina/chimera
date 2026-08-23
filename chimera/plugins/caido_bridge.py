@@ -7,6 +7,14 @@ This bridge intentionally does not assume undocumented schema names. You can:
 - run arbitrary configured GraphQL queries/mutations against your local Caido
 - optionally enable active scan actions if your Caido schema supports them
 - enforce target host scope before sending traffic-oriented requests
+
+Lifecycle
+---------
+``initialize()`` is idempotent and lazily creates exactly one aiohttp session,
+recreating it only if the previous session was closed. The bridge is also an
+async context manager — ``async with CaidoBridge(cfg) as bridge: ...`` —
+which guarantees ``cleanup()`` (session close) on exit, so unattended use
+cannot leak connector sockets.
 """
 
 from __future__ import annotations
@@ -27,32 +35,67 @@ class CaidoBridge(ToolPlugin):
         self.allowed_hosts = set(self.config.get("allowed_hosts", []) or [])
         self.enable_active_scan = bool(self.config.get("enable_active_scan", False))
         self.session = None
+        self._initialized = False
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
 
     async def initialize(self) -> None:
+        """
+        Prepare the bridge for use. Idempotent: creates the transport session
+        at most once (recreating only a closed session) and runs the soft
+        health-check exactly once. The health-check uses the transport helper
+        directly so it can never recurse back into ``initialize()``.
+        """
+        await self._ensure_session()
+
+        if self._initialized:
+            return
+        # Soft health-check. Some Caido builds may not expose introspection.
+        try:
+            await self._post_json("query { __typename }")
+        except Exception:
+            pass
+        self._initialized = True
+
+    async def cleanup(self) -> None:
+        if self.session is not None:
+            await self.session.close()
+        self.session = None
+        self._initialized = False
+
+    async def __aenter__(self) -> "CaidoBridge":
+        await self.initialize()
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> bool:
+        await self.cleanup()
+        return False
+
+    # ------------------------------------------------------------------
+    # Transport
+    # ------------------------------------------------------------------
+
+    async def _ensure_session(self) -> None:
+        """Create the aiohttp session if absent or closed. Recursion-free."""
+        if self.session is not None and not self.session.closed:
+            return
+        # Close a stale (closed) session handle before replacing it so the
+        # reference is never reused and the intent is explicit.
+        self.session = None
         try:
             import aiohttp
         except ImportError as exc:
             raise RuntimeError("aiohttp is not installed. Run: pip install aiohttp") from exc
 
-        if self.session is None:
-            headers = {}
-            if self.token:
-                headers["Authorization"] = f"Bearer {self.token}"
-            self.session = aiohttp.ClientSession(headers=headers)
+        headers = {}
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
+        self.session = aiohttp.ClientSession(headers=headers)
 
-        # Soft health-check. Some Caido builds may not expose introspection.
-        try:
-            await self.graphql("query { __typename }")
-        except Exception:
-            pass
-
-    async def cleanup(self) -> None:
-        if self.session is not None:
-            await self.session.close()
-            self.session = None
-
-    async def graphql(self, query: str, variables: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        await self.initialize()
+    async def _post_json(self, query: str, variables: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Single GraphQL round-trip against an existing session."""
         payload: Dict[str, Any] = {"query": query}
         if variables is not None:
             payload["variables"] = variables
@@ -69,6 +112,14 @@ class CaidoBridge(ToolPlugin):
         if "errors" in data:
             raise RuntimeError(f"Caido GraphQL errors: {data['errors']}")
         return data
+
+    async def graphql(self, query: str, variables: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        await self.initialize()
+        return await self._post_json(query, variables)
+
+    # ------------------------------------------------------------------
+    # Actions
+    # ------------------------------------------------------------------
 
     async def execute(self, payload: Dict[str, Any]) -> Evidence:
         action = payload.get("action", "graphql")

@@ -4,35 +4,35 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "chimera"
-version = "0.1.0"
-description = "Causal security reasoning engine"
+version = "2.1.0"
+description = "Closed-loop causal reasoning engine for offensive security"
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.11"
 authors = [{name = "Chimera Author"}]
 classifiers = [
-    "Development Status :: 2 - Pre-Alpha",
+    "Development Status :: 3 - Alpha",
     "Intended Audience :: Information Technology",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Topic :: Security",
 ]
-dependencies = [
-    "pydantic>=2.0",
-    "networkx>=3.0",
-    "pyyaml>=6.0",
-    "openai>=1.0",
-    "anthropic>=0.30",
-    "requests>=2.31",
-    "rank-bm25>=0.2.2",
-    "aiohttp>=3.9",        # Caido GraphQL bridge (chimera.plugins.caido_bridge)
-    # "docker>=7.0",       # Uncomment after installing Docker Desktop
-    # "playwright>=1.40",  # Browser layer (chimera.layers.browser_layer); manual install: playwright install chromium
-]
+# Core engine runs on the standard library alone. Optional planes are extras.
+dependencies = []
 
 [project.optional-dependencies]
+vector = [
+    "chromadb>=0.5",       # Semantic memory backend (falls back to in-memory keyword search)
+]
+http = [
+    "aiohttp>=3.9",        # Caido GraphQL bridge (chimera.plugins.caido_bridge)
+]
+browser = [
+    "playwright>=1.40",    # Browser layer (manual install: playwright install chromium)
+]
 dev = [
     "pytest>=8.0",
+    "pytest-asyncio>=0.23",
     "pytest-cov>=4.0",
     "black>=24.0",
     "ruff>=0.4",
@@ -41,6 +41,11 @@ dev = [
 
 [project.scripts]
 chimera = "chimera.__main__:main"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "--tb=short -q"
 
 [tool.setuptools.packages.find]
 where = ["."]

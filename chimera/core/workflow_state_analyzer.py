@@ -188,6 +188,30 @@ class WorkflowStateMachineAnalyzer:
                    "open", "closed", "locked", "unlocked"],
         "phase": ["review", "approval", "processing", "shipping", "delivery"],
     }
+    # Verb stems in handler names that imply a resulting state:
+    # approve_order() -> "approved", cancel_order() -> "cancelled".
+    _VERB_STATE_MAP = {
+        "approve": ("status", "approved"),
+        "approves": ("status", "approved"),
+        "reject": ("status", "rejected"),
+        "complete": ("status", "completed"),
+        "cancel": ("status", "cancelled"),
+        "suspend": ("status", "suspended"),
+        "archive": ("status", "archived"),
+        "activate": ("status", "active"),
+        "deactivate": ("status", "inactive"),
+        "publish": ("state", "published"),
+        "close": ("state", "closed"),
+        "reopen": ("state", "open"),
+        "open": ("state", "open"),
+        "lock": ("state", "locked"),
+        "unlock": ("state", "unlocked"),
+        "submit": ("status", "submitted"),
+        "refund": ("status", "refunded"),
+        "ship": ("phase", "shipping"),
+        "deliver": ("phase", "delivery"),
+        "pay": ("status", "paid"),
+    }
 
     def __init__(self) -> None:
         self.state_machines: List[StateMachine] = []
@@ -231,6 +255,19 @@ class WorkflowStateMachineAnalyzer:
 
         return self.state_machines
 
+    @staticmethod
+    def _normalize_state_value(raw: str) -> str:
+        """
+        Normalize a state value extracted from the AST.
+
+        The python parser resolves constants via ``repr`` — ``"'APPROVED'"``
+        — so strip surrounding quotes and lowercase for state naming.
+        """
+        if not raw:
+            return ""
+        value = str(raw).strip().strip("'\"")
+        return value.lower()
+
     def _find_state_modifiers(self, graph: SemanticGraph) -> List[Dict[str, Any]]:
         """Find all functions that modify state variables."""
         from chimera.core.semantic_graph import NodeType
@@ -239,10 +276,12 @@ class WorkflowStateMachineAnalyzer:
             state_ops = node.properties.get("state_operations", [])
             if state_ops:
                 for op in state_ops:
+                    # Parser emits "new_value"; tolerate legacy "value" key.
+                    raw_value = op.get("new_value") or op.get("value", "")
                     modifiers.append({
                         "function_node": node,
                         "state_var": op.get("variable", ""),
-                        "new_value": op.get("value", ""),
+                        "new_value": self._normalize_state_value(raw_value),
                         "line": op.get("line", 0),
                     })
             # Also check for status-related naming patterns
@@ -257,7 +296,32 @@ class WorkflowStateMachineAnalyzer:
                             "line": node.line_range[0],
                         })
                         break
-        return modifiers
+            # Verb-stem mapping: approve_order() implies a transition
+            # to the "approved" state even without a status assignment.
+            first_token = name_lower.split("_")[0] if name_lower else ""
+            mapped = self._VERB_STATE_MAP.get(first_token)
+            if mapped:
+                modifiers.append({
+                    "function_node": node,
+                    "state_var": mapped[0],
+                    "new_value": mapped[1],
+                    "line": node.line_range[0],
+                })
+
+        # Dedupe: one (function, state_var, new_value) key per modifier —
+        # the name-pattern and verb-map passes can agree on the same fact.
+        seen: Set[tuple] = set()
+        unique: List[Dict[str, Any]] = []
+        for mod in modifiers:
+            key = (
+                mod["function_node"].id,
+                mod["state_var"],
+                mod["new_value"],
+            )
+            if key not in seen:
+                seen.add(key)
+                unique.append(mod)
+        return unique
 
     def _group_into_machines(
         self, modifiers: List[Dict], graph: SemanticGraph
@@ -338,38 +402,38 @@ class WorkflowStateMachineAnalyzer:
                 sm.states[initial_candidate].is_initial = True
                 break
 
-        # Create transitions
+        # Create transitions (deduped on (from, to, trigger))
+        seen_transitions: Set[tuple] = set()
+
+        def _add_transition(from_state: str, to_state: str, func_node: Any) -> None:
+            key = (from_state, to_state, func_node.id)
+            if key in seen_transitions:
+                return
+            seen_transitions.add(key)
+            t = Transition(
+                name=f"{func_node.name}_{from_state}_to_{to_state}",
+                from_state=from_state,
+                to_state=to_state,
+                trigger_function_id=func_node.id,
+            )
+            t.is_guarded = self._check_has_guard(func_node, graph)
+            if t.is_guarded:
+                t.guard_ids = self._get_guard_ids(func_node, graph)
+            sm.transitions.append(t)
+
         for mod in modifiers:
             func_node = mod["function_node"]
             from_state = self._infer_from_state(func_node, graph)
             to_state = mod["new_value"].lower()
 
             if not from_state:
-                # If we can't determine from_state, create transitions from all states
-                for sname in sm.states:
-                    if sname != to_state:
-                        t = Transition(
-                            name=f"{func_node.name}_{sname}_to_{to_state}",
-                            from_state=sname,
-                            to_state=to_state,
-                            trigger_function_id=func_node.id,
-                        )
-                        t.is_guarded = self._check_has_guard(func_node, graph)
-                        if t.is_guarded:
-                            t.guard_ids = self._get_guard_ids(func_node, graph)
-                        sm.transitions.append(t)
+                # Unknown precondition: a single wildcard transition stands in
+                # for "from any state".  Expanding to N concrete transitions
+                # would report the same missing guard N times.
+                _add_transition("*", to_state, func_node)
             else:
                 if from_state in sm.states:
-                    t = Transition(
-                        name=f"{func_node.name}_{from_state}_to_{to_state}",
-                        from_state=from_state,
-                        to_state=to_state,
-                        trigger_function_id=func_node.id,
-                    )
-                    t.is_guarded = self._check_has_guard(func_node, graph)
-                    if t.is_guarded:
-                        t.guard_ids = self._get_guard_ids(func_node, graph)
-                    sm.transitions.append(t)
+                    _add_transition(from_state, to_state, func_node)
 
         return sm if sm.states else None
 
@@ -423,7 +487,9 @@ class WorkflowStateMachineAnalyzer:
                     state_ops = method_node.properties.get("state_operations", [])
                     for op in state_ops:
                         if op.get("variable", "").lower() == field_name.lower():
-                            to_state = op.get("value", "").lower()
+                            to_state = self._normalize_state_value(
+                                op.get("new_value") or op.get("value", "")
+                            )
                             if to_state in sm.states:
                                 for sname in sm.states:
                                     if sname != to_state:
@@ -456,10 +522,25 @@ class WorkflowStateMachineAnalyzer:
         """Check if a transition function has a guard via graph traversal."""
         from chimera.core.semantic_graph import EdgeType
 
-        # Check incoming GUARDS/AUTHORIZES edges
+        # Parser-emitted inline guards (is_admin gates, PermissionError...)
+        if func_node.properties.get("auth_checks"):
+            return True
+        if "auth_checked" in getattr(func_node, "semantic_tags", set()):
+            return True
+
+        # Incoming AUTHORIZES / GUARDS edges are conclusive — the parser only
+        # creates them for auth-classified decorators. A bare DECORATES edge
+        # (e.g. @app.route) is NOT a guard; the decorator name must be authy.
         for edge in graph.get_incoming_edges(func_node.id):
-            if edge.edge_type in {EdgeType.GUARDS, EdgeType.AUTHORIZES, EdgeType.DECORATES}:
+            if edge.edge_type in {EdgeType.GUARDS, EdgeType.AUTHORIZES}:
                 return True
+            if edge.edge_type == EdgeType.DECORATES:
+                src = graph.get_node(edge.source_id)
+                if src and (
+                    src.properties.get("is_auth")
+                    or any(kw in src.name.lower() for kw in ("login", "auth", "permission", "role"))
+                ):
+                    return True
 
         # Check if the function calls any guard-like function
         guard_names = {"check", "guard", "validate", "verify", "can", "is_allowed", "permit"}
@@ -618,7 +699,58 @@ class WorkflowStateMachineAnalyzer:
         )
         differentials.extend(entity_differentials)
 
-        return differentials
+        # Grammar differentials (unsafe sinks) — violations of the universal
+        # expectation "queries/commands must not be string-built with
+        # attacker-controlled values". No per-entity intent needed.
+        from chimera.core.semantic_graph import NodeType
+        for node_type in (NodeType.FUNCTION, NodeType.ENDPOINT):
+            for node in graph.find_nodes_by_type(node_type):
+                for obs in impl_model.get_observations_for(node.id):
+                    if obs.observation_type != "unsafe_sql":
+                        continue
+                    differentials.append(StateMachineDifferential(
+                        state_machine_name="grammar_cascade",
+                        differential_type="unsafe_sink",
+                        expected=(
+                            f"'{node.name}' should only execute parameterized "
+                            f"queries (bound parameters keep data out of the SQL grammar)"
+                        ),
+                        observed=obs.description,
+                        severity=0.85,
+                        entity_ids=[node.id],
+                        context={
+                            "observation": obs.to_dict() if hasattr(obs, "to_dict") else {},
+                            "vulnerability_class": "injection",
+                        },
+                        file_path=node.file_path,
+                    ))
+
+        # Final dedupe: one differential per (primary entity, concern). The
+        # same missing guard must never be reported twice under different
+        # framings (entity-level IDOR vs state-machine privilege_escalation_horizontal
+        # describe the same ownership gap). Keep the highest-severity framing.
+        concern_of = {
+            "idor": "ownership",
+            "privilege_escalation_horizontal": "ownership",
+            "privilege_escalation_vertical": "auth",
+            "state_machine_violation": "state",
+            "workflow_bypass": "bypass",
+            "race_condition": "auth",
+            "injection": "injection",
+        }
+        best: Dict[tuple, StateMachineDifferential] = {}
+        for d in differentials:
+            vuln_class = d.context.get("vulnerability_class", "")
+            concern = concern_of.get(vuln_class, d.differential_type)
+            if d.differential_type == "bypass_path":
+                concern = "bypass"
+            elif d.differential_type == "missing_state":
+                concern = "state_reachability"
+            key = (d.entity_ids[0] if d.entity_ids else "", concern)
+            existing = best.get(key)
+            if existing is None or d.severity > existing.severity:
+                best[key] = d
+        return list(best.values())
 
     def _is_bypass(self, sm: StateMachine, transition: Transition) -> bool:
         """
@@ -728,21 +860,40 @@ class WorkflowStateMachineAnalyzer:
                         obs.observation_type == "no_ownership" for obs in observations
                     )
                     if has_no_ownership:
+                        # Guard-kind mismatch: when the handler enforces a ROLE
+                        # gate (is_staff/is_admin...) but not ownership, the
+                        # unguarded-caller premise is false. The residual claim
+                        # — "the gate uses a different principal than intended"
+                        # — is materially weaker than pure IDOR.
+                        guard_kind_mismatch = False
+                        if node is not None:
+                            guard_kind_mismatch = bool(
+                                node.properties.get("auth_checks")
+                                or "auth_checked" in node.semantic_tags
+                            )
+                        severity = exp.confidence * (0.35 if guard_kind_mismatch else 0.85)
+                        observed_text = (
+                            f"No ownership verification found on '{entity_name}'. "
+                            f"Resource ID parameter is used without comparing against "
+                            f"the requesting user's ID."
+                        )
+                        if guard_kind_mismatch:
+                            observed_text += (
+                                " Note: a role/attribute guard IS present — this is a "
+                                "guard-kind mismatch, not an unguarded endpoint."
+                            )
                         differentials.append(StateMachineDifferential(
                             state_machine_name="entity_ownership",
                             differential_type="missing_guard",
                             expected=exp.description,
-                            observed=(
-                                f"No ownership verification found on '{entity_name}'. "
-                                f"Resource ID parameter is used without comparing against "
-                                f"the requesting user's ID."
-                            ),
-                            severity=exp.confidence * 0.85,
+                            observed=observed_text,
+                            severity=severity,
                             entity_ids=[entity_id],
                             context={
                                 "expectation": exp.to_dict(),
                                 "observations": [o.to_dict() for o in observations],
                                 "vulnerability_class": "idor",
+                                "guard_kind_mismatch": guard_kind_mismatch,
                             },
                             file_path=file_path,
                         ))

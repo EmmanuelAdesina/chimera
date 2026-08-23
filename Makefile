@@ -1,4 +1,4 @@
-﻿.PHONY: install test format lint clean run
+.PHONY: install test format lint clean run
 
 install:
 	pip install -e ".[dev]"
@@ -15,7 +15,7 @@ lint:
 	ruff check chimera/ tests/
 
 run:
-	python -m chimera analyze
+	python -m chimera analyze tests/targets/vuln_orders_app.py
 
 clean:
 	rm -rf build/ dist/ *.egg-info .pytest_cache .mypy_cache data/

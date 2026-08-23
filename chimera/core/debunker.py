@@ -35,6 +35,16 @@ class DebunkResult:
     kill_reason: str = ""
     suggested_refinement: str = ""
 
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "attack_name": self.attack_name,
+            "survived": self.survived,
+            "score": self.score,
+            "reasoning": self.reasoning,
+            "kill_reason": self.kill_reason,
+            "suggested_refinement": self.suggested_refinement,
+        }
+
 
 @dataclass
 class DebunkReport:
@@ -44,6 +54,15 @@ class DebunkReport:
     attack_results: List[DebunkResult]
     overall_score: float
     recommendation: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "hypothesis_id": self.hypothesis_id,
+            "survived_all": self.survived_all,
+            "attack_results": [r.to_dict() for r in self.attack_results],
+            "overall_score": self.overall_score,
+            "recommendation": self.recommendation,
+        }
 
 
 class Debunker:
@@ -110,8 +129,8 @@ class Debunker:
             self._record_attack(name, result)
             if not result.survived:
                 # Hypothesis killed — stop immediately
-                hypothesis.debunker_notes[name] = result.to_dict() if hasattr(result, 'to_dict') else {"survived": False, "kill_reason": result.kill_reason}
-                hypothesis.transition_to(HypothesisStatus.DEBUNKED) if hasattr(hypothesis, 'transition_to') else None
+                hypothesis.debunker_notes[name] = result.to_dict()
+                self._record_verdict(hypothesis, killed=True)
                 self.total_debunked += 1
                 return DebunkReport(
                     hypothesis_id=hypothesis.id,
@@ -135,6 +154,23 @@ class Debunker:
             r.attack_name: {"score": r.score, "reasoning": r.reasoning}
             for r in results
         }
+        # Record the overall score for the epistemic engine's
+        # adversarial-survival signal.
+        hypothesis.metadata["debunker_overall_score"] = overall
+
+        if rec == "kill":
+            # A sub-0.3 survivor is still killed — record the verdict so the
+            # hypothesis status is consistent with the recommendation.
+            self._record_verdict(hypothesis, killed=True)
+            self.total_debunked += 1
+            return DebunkReport(
+                hypothesis_id=hypothesis.id,
+                survived_all=False,
+                attack_results=results,
+                overall_score=overall,
+                recommendation=rec,
+            )
+
         self.total_survived += 1
 
         return DebunkReport(
@@ -144,6 +180,22 @@ class Debunker:
             overall_score=overall,
             recommendation=rec,
         )
+
+    @staticmethod
+    def _record_verdict(hypothesis: "Hypothesis", killed: bool) -> None:
+        """Record a debunk verdict on the hypothesis, respecting transitions."""
+        from chimera.models.hypothesis import HypothesisStatus
+        if not killed:
+            return
+        try:
+            if hypothesis.status == HypothesisStatus.UNDER_REVIEW:
+                hypothesis.transition_to(HypothesisStatus.DEBUNKED)
+            elif hypothesis.status == HypothesisStatus.GENERATED:
+                hypothesis.transition_to(HypothesisStatus.UNDER_REVIEW)
+                hypothesis.transition_to(HypothesisStatus.DEBUNKED)
+        except ValueError:
+            # Status already terminal — leave as-is; verdict is in the report.
+            pass
 
     # ==================================================================
     # ATTACK 1: Tautology Check
@@ -322,21 +374,36 @@ class Debunker:
             )
             score -= 0.15
 
-        # Counter-example 3: The function may be internal-only
+        # Counter-example 3: The function may be internal-only.
+        # Only genuinely-private helpers (leading underscore, no route, no
+        # endpoint tag) earn this discount — business handlers ARE reachable
+        # through framework routing the graph may not model.
         if h.attack_surface:
             for eid in h.attack_surface:
                 if graph:
                     node = graph.get_node(eid)
                     if node:
-                        # Check if function is not exposed as an endpoint
                         has_route = node.properties.get("route", "")
-                        is_endpoint = node.properties.get("is_endpoint", False)
-                        if not has_route and not is_endpoint:
+                        is_endpoint = (
+                            node.properties.get("is_endpoint", False)
+                            or node.node_type.value == "endpoint"
+                            or "endpoint" in node.semantic_tags
+                        )
+                        is_private = node.name.startswith("_")
+                        if is_private and not has_route and not is_endpoint:
                             counter_examples.append(
-                                f"Function '{node.name}' is not directly exposed as an HTTP endpoint. "
-                                f"It may only be called internally with pre-validated inputs."
+                                f"Function '{node.name}' is a private helper not exposed as "
+                                f"an HTTP endpoint. It may only be called internally with "
+                                f"pre-validated inputs."
                             )
-                            score -= 0.25
+                            score -= 0.15
+                            break
+                        if not has_route and not is_endpoint and not is_private:
+                            counter_examples.append(
+                                f"Function '{node.name}' has no visible route binding in the "
+                                f"graph; exposure depends on framework wiring."
+                            )
+                            score -= 0.05
                             break
 
         # Counter-example 4: Overgeneralization from one code pattern
@@ -413,9 +480,17 @@ class Debunker:
                 # Check for unexplained leaps
                 if i > 0:
                     prev = h.causal_chain[i-1].lower()
-                    # A leap exists if consecutive steps have no shared concepts
-                    prev_words = set(prev.split())
-                    curr_words = set(step_lower.split())
+                    # A leap exists if consecutive steps share no *content*
+                    # concepts — stopwords and structural tokens don't count.
+                    stopwords = {
+                        "the", "a", "an", "in", "on", "of", "to", "and", "or",
+                        "is", "are", "be", "by", "for", "with", "from", "at",
+                        "this", "that", "it", "its", "can", "not", "no",
+                        "root", "cause:", "mechanism:", "impact:", "—", "->", "-",
+                        "via", "any", "all",
+                    }
+                    prev_words = {w.strip(",.;:()") for w in prev.split()} - stopwords
+                    curr_words = {w.strip(",.;:()") for w in step_lower.split()} - stopwords
                     shared = prev_words & curr_words
                     if len(shared) == 0 and len(prev_words) > 3 and len(curr_words) > 3:
                         score -= 0.15
@@ -737,7 +812,8 @@ class Debunker:
         else:
             # Check if the vulnerability class is in our target set
             target_classes = {"idor", "privilege_escalation_horizontal", "privilege_escalation_vertical",
-                             "workflow_bypass", "race_condition", "state_machine_violation"}
+                             "workflow_bypass", "race_condition", "state_machine_violation",
+                             "injection"}
             if h.vulnerability_class.value not in target_classes:
                 score -= 0.3
                 issues.append(

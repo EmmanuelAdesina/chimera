@@ -63,6 +63,9 @@ class CausalDifferentialEngine:
         "missing_state": {
             "state_machine_violation": 0.4,
         },
+        "unsafe_sink": {
+            "injection": 0.85,
+        },
     }
 
     def __init__(
@@ -142,6 +145,28 @@ class CausalDifferentialEngine:
             # Step 7: Set severity based on vulnerability class and differential
             hypothesis.severity = self._assess_severity(diff, vuln_class)
 
+            # Step 7b: Carry route metadata so experiment plans target real
+            # URLs instead of hypothesis-id fragments.
+            for entity_id in diff.entity_ids:
+                node = graph.get_node(entity_id) if graph else None
+                if node is None:
+                    continue
+                route = node.properties.get("route")
+                if route and "route" not in hypothesis.metadata:
+                    hypothesis.metadata["route"] = route
+                    hypothesis.metadata["method"] = node.properties.get("method", "GET")
+
+            # Step 8: Attach static evidence — the differential itself, plus the
+            # graph entities it references. Evidence is the currency: without it
+            # the epistemic engine mathematically suppresses every hypothesis.
+            for ev in self._build_static_evidence(diff, vuln_class, graph):
+                hypothesis.add_evidence(ev)
+
+            # Step 9: Seed falsifiers — a hypothesis with no falsifiers is
+            # unfalsifiable and the Debunker rightly destroys it.
+            for falsifier in self._infer_falsifiers(diff, vuln_class):
+                hypothesis.add_falsifier(falsifier)
+
             hypotheses.append(hypothesis)
             self._hypothesis_count += 1
 
@@ -208,6 +233,11 @@ class CausalDifferentialEngine:
             "race_condition": (
                 "Impact: Concurrent requests can exploit timing to bypass checks"
             ),
+            "injection": (
+                "Impact: Attacker can inject input that crosses a grammar "
+                "boundary (SQL/command/template), reading or modifying data "
+                "outside their authorization"
+            ),
         }
         chain.append(impact_map.get(vuln_class, "Impact: Security-relevant deviation from expected behavior"))
 
@@ -253,6 +283,7 @@ class CausalDifferentialEngine:
             "workflow_bypass": 0.05,
             "state_machine_violation": 0.05,
             "race_condition": 0.0,
+            "injection": 0.1,
         }
         base += class_boost.get(vuln_class.value, 0.0)
 
@@ -309,12 +340,20 @@ class CausalDifferentialEngine:
             prereqs.append(
                 "The system must not have compensating controls outside the analyzed code"
             )
+        elif vuln_class.value == "injection":
+            prereqs.append(
+                "The interpolated value must be attacker-controllable at runtime"
+            )
+            prereqs.append(
+                "The constructed statement must reach a live interpreter "
+                "(database driver, shell, template engine)"
+            )
 
         return prereqs
 
     def _assess_severity(
-        self, diff: StateMachineDifferential, vuln_class: VulnerabilityClass
-    ) -> Severity:
+        self, diff: StateMachineDifferential, vuln_class: "VulnerabilityClass"
+    ) -> "Severity":
         """Assess severity based on vulnerability class and differential."""
         from chimera.models.hypothesis import Severity
 
@@ -325,5 +364,164 @@ class CausalDifferentialEngine:
             "workflow_bypass": Severity.MEDIUM,
             "state_machine_violation": Severity.MEDIUM,
             "race_condition": Severity.HIGH,
+            "injection": Severity.HIGH,
         }
         return severity_map.get(vuln_class.value, Severity.MEDIUM)
+
+    # ------------------------------------------------------------------
+    # Evidence construction — static analysis is evidence too
+    # ------------------------------------------------------------------
+
+    def _build_static_evidence(
+        self,
+        diff: StateMachineDifferential,
+        vuln_class: "VulnerabilityClass",
+        graph: "SemanticGraph",
+    ) -> List["Evidence"]:
+        """
+        Build the static-evidence bundle for a differential.
+
+        Every hypothesis must leave the generation phase carrying:
+          1. a DIFFERENTIAL_RESULT evidence describing the contradiction;
+          2. one SEMANTIC_GRAPH_NODE evidence per referenced entity (capped).
+
+        This is what allows the epistemic engine to score static findings
+        instead of suppressing all of them, and gives the Debunker's
+        confirmation-bias vector real input to chew on.
+        """
+        from chimera.models.evidence import (
+            ChainOfCustody,
+            Evidence,
+            EvidenceSource,
+            EvidenceType,
+        )
+        import uuid as _uuid
+
+        evidence_items: List[Evidence] = []
+
+        # 1) The differential itself
+        chain = ChainOfCustody()
+        ev_id = f"EVD-{_uuid.uuid4().hex[:10].upper()}"
+        chain.add_step(
+            tool="WorkflowStateMachineAnalyzer",
+            action="compute_differentials",
+            input_ref=diff.state_machine_name,
+            output_ref=ev_id,
+            parameters={"differential_type": diff.differential_type},
+        )
+        chain.add_step(
+            tool="CausalDifferentialEngine",
+            action="classify_vulnerability",
+            input_ref=ev_id,
+            output_ref=ev_id,
+            parameters={"vulnerability_class": vuln_class.value},
+        )
+        chain.finalize()
+        evidence_items.append(Evidence(
+            source=EvidenceSource.DIFFERENTIAL_ENGINE,
+            evidence_type=EvidenceType.DIFFERENTIAL_RESULT,
+            data={
+                "differential": diff.to_dict() if hasattr(diff, "to_dict") else {},
+                "vulnerability_class": vuln_class.value,
+            },
+            chain_of_custody=chain,
+            confidence=min(0.95, 0.5 + diff.severity * 0.5),
+            description=(
+                f"Semantic differential '{diff.differential_type}' on "
+                f"{diff.state_machine_name}: expected {diff.expected[:120]!r}, "
+                f"observed {diff.observed[:120]!r}"
+            ),
+            metadata={"engine": "causal_differential"},
+        ))
+
+        # 2) Graph entities referenced by the differential (cap: 4)
+        for entity_id in diff.entity_ids[:4]:
+            node = graph.get_node(entity_id) if graph else None
+            if node is None:
+                continue
+            node_chain = ChainOfCustody()
+            node_ev_id = f"EVD-{_uuid.uuid4().hex[:10].upper()}"
+            node_chain.add_step(
+                tool="SemanticGraph",
+                action="extract_entity",
+                input_ref=entity_id,
+                output_ref=node_ev_id,
+                parameters={"node_name": node.name, "file": node.file_path},
+            )
+            node_chain.finalize()
+            evidence_items.append(Evidence(
+                source=EvidenceSource.STATIC_ANALYSIS,
+                evidence_type=EvidenceType.SEMANTIC_GRAPH_NODE,
+                data={
+                    "node_id": node.id,
+                    "node_name": node.name,
+                    "node_type": node.node_type.value,
+                    "line_range": list(node.line_range),
+                    "semantic_tags": sorted(node.semantic_tags),
+                },
+                chain_of_custody=node_chain,
+                confidence=0.9,
+                description=(
+                    f"Graph entity '{node.name}' ({node.node_type.value}) at "
+                    f"{node.file_path}:{node.line_range[0]}"
+                ),
+                metadata={"entity_id": entity_id},
+            ))
+
+        return evidence_items
+
+    def _infer_falsifiers(
+        self, diff: StateMachineDifferential, vuln_class: "VulnerabilityClass"
+    ) -> List[str]:
+        """
+        Seed the falsifier set for a hypothesis.
+
+        A hypothesis without falsifiers is scientifically empty — the
+        Debunker's tautology vector kills it outright. Falsifiers name the
+        concrete observations that would prove the claim wrong.
+        """
+        falsifiers = [
+            "A guard exists but was missed during static analysis "
+            "(indirect authorization via decorator, mixin, or base class)",
+            "Runtime middleware enforces the constraint not visible in source code",
+        ]
+        vc = vuln_class.value
+        if vc == "idor":
+            falsifiers.append(
+                "A request with another user's resource ID is rejected with "
+                "403/404 at runtime (ownership enforced elsewhere)"
+            )
+            falsifiers.append(
+                "The resource identifier is not attacker-controllable "
+                "(server-side scoping via session, not request parameters)"
+            )
+        elif vc in {"privilege_escalation_vertical", "privilege_escalation_horizontal"}:
+            falsifiers.append(
+                "A low-privilege request to the handler is rejected with "
+                "401/403 (authorization enforced at a layer the graph cannot see)"
+            )
+        elif vc == "workflow_bypass":
+            falsifiers.append(
+                "The skipped transition is rejected by a database constraint "
+                "or transaction-level guard"
+            )
+        elif vc == "state_machine_violation":
+            falsifiers.append(
+                "The invalid state is rejected at the persistence layer "
+                "(CHECK constraint, enum validation, or trigger)"
+            )
+        elif vc == "race_condition":
+            falsifiers.append(
+                "Concurrent execution is serialized by a lock, atomic "
+                "operation, or transaction isolation level"
+            )
+        elif vc == "injection":
+            falsifiers.append(
+                "The interpolated values are fully server-controlled constants "
+                "(no attacker influence on query text)"
+            )
+            falsifiers.append(
+                "The driver rejects multi-statement/escape input "
+                "(emulated parameterization at the connector level)"
+            )
+        return falsifiers

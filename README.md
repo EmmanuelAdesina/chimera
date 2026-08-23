@@ -6,9 +6,9 @@
 *It does not match signatures. It falsifies assumptions.*
 
 ![Python](https://img.shields.io/badge/python-3.11%2B-blue?style=for-the-badge)
-![Tests](https://img.shields.io/badge/integration%20tests-9%2F9%20passing-brightgreen?style=for-the-badge)
-![Core](https://img.shields.io/badge/core-6%2C600%2B%20LOC-orange?style=for-the-badge)
-![Status](https://img.shields.io/badge/status-v2.0%20%2B%20swarm%20plane-red?style=for-the-badge)
+![Tests](https://img.shields.io/badge/tests-144%20passing-brightgreen?style=for-the-badge)
+![Dependencies](https://img.shields.io/badge/core%20dependencies-zero-orange?style=for-the-badge)
+![Status](https://img.shields.io/badge/status-v2.1%20closed--loop-red?style=for-the-badge)
 
 **Your scanner has a signature list. Chimera has a scientific method.**
 
@@ -66,6 +66,7 @@ flowchart LR
 
 - **IDOR** — insecure direct object references via data-flow differentials
 - **Horizontal / Vertical Privilege Escalation**
+- **Injection** — grammar differentials (string-built SQL vs parameterized queries)
 - **Workflow Bypasses** — state-machine extraction and illegal transitions
 - **Race Conditions** — including async TOCTOU across await boundaries
 - **State Machine Violations**
@@ -102,11 +103,27 @@ Chimera treats external tools as **epistemic sensors**, not products:
 ```bash
 git clone https://github.com/emmanuelAdesina/chimera
 cd chimera
-pip install chromadb aiohttp playwright
-playwright install chromium
-python -m compileall chimera
-python -m unittest discover tests -v
+python -m pip install -e .          # core runs on the standard library alone
+python -m pytest tests/             # 144 tests
 ```
+
+Run your first analysis (no installs, no services needed):
+
+```bash
+python -m chimera analyze tests/targets/vuln_orders_app.py
+python -m chimera analyze ./your_service --json report.json
+python -m chimera analyze ./app --threshold 0.65 --budget 20
+python -m chimera analyze ./app --fail-on-findings   # exit 1 on confirmed vulns (CI gating)
+```
+
+What the loop does on a static target:
+**parse → intent → implementation → differentials → hypotheses (born with
+evidence + falsifiers) → hostile debunking (9 vectors) → epistemic calibration
+→ static verification probes (the loop closes) → report.**
+
+Optional planes install as extras: `pip install -e ".[vector]"` (ChromaDB
+semantic memory), `".[http]"` (Caido bridge), `".[browser]"` (Playwright
+layer). Every one degrades gracefully when absent.
 
 Dispatch your first swarm:
 
