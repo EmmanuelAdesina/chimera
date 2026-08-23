@@ -277,6 +277,19 @@ class ImplementationModel:
                        ["user", "owner", "created_by", "author"]):
                     return True
 
+        # Parser-emitted comparison records (python_parser._extract_comparisons)
+        for comp in node.properties.get("comparisons", []):
+            all_parts = str(comp.get("left", "")) + " ".join(
+                str(c) for c in comp.get("comparators", [])
+            )
+            if any(kw in all_parts.lower() for kw in
+                   ["user", "owner", "created_by", "author"]):
+                return True
+
+        # Parser tags likely ownership comparisons directly
+        if "ownership_check" in getattr(node, "semantic_tags", set()):
+            return True
+
         return False
 
     def _check_state_guard_via_graph(self, node: GraphNode, graph: SemanticGraph) -> bool:
