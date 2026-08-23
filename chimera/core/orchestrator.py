@@ -127,7 +127,7 @@ class ChimeraOrchestrator:
 
     def _parse_file(self, file_path: str) -> None:
         """Parse a single file using the appropriate parser."""
-        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+        with open(file_path, "r", encoding="utf-8-sig", errors="ignore") as f:
             source = f.read()
         if not source.strip():
             return
